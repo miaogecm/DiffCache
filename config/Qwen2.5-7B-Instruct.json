@@ -1,0 +1,6 @@
+{
+    "index_layer_prob": "0.05",
+    "minibatch_size": 4,
+    "num_seeds": 128,
+    "retrieval_budget": 1000
+}
