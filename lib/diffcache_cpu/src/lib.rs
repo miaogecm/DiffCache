@@ -171,9 +171,9 @@ pub struct Options {
     m: usize,
     ef_cons: usize,
     thread_pool_size: usize,
-    num_seeds: usize,
     r_sq: f32,
-    group_query: bool
+    group_query: bool,
+    batch_search: bool
 }
 
 pub struct DataLayer<T: Clone> {
@@ -276,9 +276,11 @@ impl<T: 'static + Send + Sync + Clone + Value + Copy + InnerProduct + L2Square> 
     // vals: (bsz, kv_head_num, head_dim)
     // ep:   (bsz, kv_head_num, num_seeds)
     pub fn insert(&mut self, keys: ArrayView3<T>, vals: ArrayView3<T>, ep: ArrayView3<Neighbour>) -> Handle<InsertResult> {
+        let num_seeds = ep.shape()[2];
+
         assert_eq!(keys.shape(), &[self.bsz, self.kv_head_num, self.head_dim]);
         assert_eq!(vals.shape(), &[self.bsz, self.kv_head_num, self.head_dim]);
-        assert_eq!(ep.shape(),   &[self.bsz, self.kv_head_num, self.opt.num_seeds]);
+        assert_eq!(ep.shape(),   &[self.bsz, self.kv_head_num, num_seeds]);
 
         let node_id = self.ctx_len as NodeID;
         self.ctx_len += 1;
@@ -307,11 +309,13 @@ impl<T: 'static + Send + Sync + Clone + Value + Copy + InnerProduct + L2Square> 
     // ep:      (bsz, kv_head_num, num_seeds) for group_query
     //          (bsz, q_head_num,  num_seeds) for non-group_query
     pub fn query(&self, queries: ArrayView3<T>, ef: usize, ep: ArrayView3<Neighbour>) -> Handle<QueryResult<T>> {
+        let num_seeds = ep.shape()[2];
+
         assert_eq!(queries.shape(), &[self.bsz, self.q_head_num, self.head_dim]);
         if self.opt.group_query {
-            assert_eq!(ep.shape(), &[self.bsz, self.kv_head_num, self.opt.num_seeds]);
+            assert_eq!(ep.shape(), &[self.bsz, self.kv_head_num, num_seeds]);
         } else {
-            assert_eq!(ep.shape(), &[self.bsz, self.q_head_num, self.opt.num_seeds]);
+            assert_eq!(ep.shape(), &[self.bsz, self.q_head_num, num_seeds]);
         }
 
         let group_size = self.q_head_num / self.kv_head_num;
@@ -404,9 +408,9 @@ impl DiffCacheCPU {
             m: 16,
             ef_cons: 200,
             thread_pool_size: 16,
-            num_seeds: 32,
             r_sq: 4.0,
-            group_query: true
+            group_query: true,
+            batch_search: false
         };
         if let Some(dict) = kwargs {
             for (key, value) in dict.iter() {
@@ -415,9 +419,9 @@ impl DiffCacheCPU {
                     k if k == "m" => opt.m = value.extract::<usize>().unwrap(),
                     k if k == "ef_cons" => opt.ef_cons = value.extract::<usize>().unwrap(),
                     k if k == "thread_pool_size" => opt.thread_pool_size = value.extract::<usize>().unwrap(),
-                    k if k == "num_seeds" => opt.num_seeds = value.extract::<usize>().unwrap(),
                     k if k == "r_sq" => opt.r_sq = value.extract::<f32>().unwrap(),
                     k if k == "group_query" => opt.group_query = value.extract::<bool>().unwrap(),
+                    k if k == "batch_search" => opt.batch_search = value.extract::<bool>().unwrap(),
                     _ => panic!("Unknown option {key}"),
                 }
             }

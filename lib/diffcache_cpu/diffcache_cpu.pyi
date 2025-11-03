@@ -29,7 +29,6 @@ class DiffCacheCPU:
         m: int = 16,
         ef_cons: int = 200,
         thread_pool_size: int = 16,
-        num_seeds: int = 32,
         r_sq: float = 4.0,
         group_query: bool = True,
     ) -> None: ...

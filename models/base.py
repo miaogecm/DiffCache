@@ -9,20 +9,21 @@ class BaseModel:
         model_name: str,
         max_length: int,
         dtype: torch.dtype,
-        device_map: str
     ) -> None:
         """ Initializes the LLM.
         Args:
             model_name (str): The name of the model.
             max_length (int): The maximum length (prefill+decode) of sequences.
             dtype (torch.dtype): The data type for model computations.
-            device_map (str): The device for model, suppor 'cuda:x' or 'auto (automatically use all visible GPUs)'.
         """
 
         self.model_name = model_name
         self.max_length = max_length
         self.dtype = dtype
-        self.device_map = device_map
+        self.device_map = 'cuda:0'
+
+        # TODO: only bf16 is supported for now
+        assert(dtype == 'bf16')
 
 
     def layer_prefill(self, layer_idx, start_bdx, hidden_states):
@@ -44,18 +45,16 @@ class BaseModel:
         query_states, key_states, value_states = self.wqkv(temp_hidden_states, layer)
         del temp_hidden_states
         torch.cuda.empty_cache()
-        query_states, key_states = self.position_embedd(query_states, key_states)
+        query_states, key_states = self.position_embedd(query_states, key_states, self.kv_cache.cached_seq_len[layer_idx])
 
         query_states = query_states.view(bsz, seq_len, self.num_heads, self.head_dim)       # reshape [bs, seq_len, dim] => [bs, seq_len, head, head_dim]
         key_states = key_states.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
         value_states = value_states.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
 
-        key_states, value_states = self.kv_cache.prefill_update_kv_cache(query_states, key_states, value_states, layer_idx, start_bdx)
+        key_states, value_states = self.kv_cache.prefill_update_kv_cache(key_states, value_states, layer_idx)
         torch.cuda.empty_cache()
 
         temp_attn_out = self.prefill_attention(query_states, key_states, value_states)
-
-        self.kv_cache.sync(layer_idx, start_bdx)
 
         del query_states, key_states, value_states
         torch.cuda.empty_cache()
@@ -93,7 +92,7 @@ class BaseModel:
         hidden_states = self.layernorm(hidden_states, layer.input_layernorm_variance_epsilon, layer.input_layernorm_weight)
         
         query_states, key_states, value_states = self.wqkv(hidden_states, layer)
-        query_states, key_states = self.position_embedd(query_states, key_states)
+        query_states, key_states = self.position_embedd(query_states, key_states, self.kv_cache.cached_seq_len[layer_idx])
 
         query_states = query_states.view(bsz, -1, self.num_heads, self.head_dim)
         key_states = key_states.view(bsz, -1, self.num_key_value_heads, self.head_dim)
@@ -121,17 +120,10 @@ class BaseModel:
             end_bdx = min(bsz, start_bdx + 1)
             hidden_states = self.word_embedding(inputs_ids[start_bdx:end_bdx])  # [1, seq_len, hidden_size]
 
-            if self.num_gpus > 1:
-                for ldx in range(self.num_layers):
-                    hidden_states = self.layer_prefill(ldx, start_bdx, hidden_states)
-                    hidden_states = self.parameter_move(hidden_states, ldx)
-                    torch.cuda.empty_cache()
-                last_hidden_states[start_bdx:end_bdx] = hidden_states[:, -1:, :].to(self.layers[0].device)
-            else:
-                for ldx in range(self.num_layers):
-                    hidden_states = self.layer_prefill(ldx, start_bdx, hidden_states)
-                    torch.cuda.empty_cache()
-                last_hidden_states[start_bdx:end_bdx] = hidden_states[:, -1:, :]
+            for ldx in range(self.num_layers):
+                hidden_states = self.layer_prefill(ldx, start_bdx, hidden_states)
+                torch.cuda.empty_cache()
+            last_hidden_states[start_bdx:end_bdx] = hidden_states[:, -1:, :]
         
         last_hidden_states = self.layernorm(last_hidden_states.contiguous(), self.norm_variance_epsilon, self.norm_weight)
         logits = self.lm(last_hidden_states)
@@ -142,14 +134,8 @@ class BaseModel:
     def decode_forward(self, inputs_ids):
         hidden_states = self.word_embedding(inputs_ids)
 
-        if self.num_gpus > 1:
-            for ldx in range(self.num_layers):
-                hidden_states = self.layer_decode(ldx, hidden_states)
-                hidden_states = self.parameter_move(hidden_states, ldx)
-            hidden_states = hidden_states.to(self.layers[0].device)
-        else:
-            for ldx in range(self.num_layers):
-                hidden_states = self.layer_decode(ldx, hidden_states)
+        for ldx in range(self.num_layers):
+            hidden_states = self.layer_decode(ldx, hidden_states)
         
         hidden_states = self.layernorm(hidden_states[:, -1:, :], self.norm_variance_epsilon, self.norm_weight)
         logits = self.lm(hidden_states)
@@ -168,7 +154,6 @@ class BaseModel:
         logits = self.prefill_forward(inputs_ids=inputs_ids)
         output_ids = logits.argmax(dim=-1)
         outputs_ids.append(output_ids)
-        self.move()
 
         torch.cuda.synchronize()
         prefill_end = time.time()

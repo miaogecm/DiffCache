@@ -51,10 +51,9 @@ class LlamaModel(BaseModel):
         self, 
         model_name: str,
         max_length: int,
-        dtype: torch.dtype,
-        device_map: str
+        dtype: torch.dtype
     ) -> None:
-        super().__init__(model_name, max_length, dtype, device_map)
+        super().__init__(model_name, max_length, dtype)
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.config = LlamaConfig.from_pretrained(model_name)
@@ -80,59 +79,28 @@ class LlamaModel(BaseModel):
     def init_model(self):
         hf_llama = LlamaForCausalLM.from_pretrained(self.model_name, torch_dtype=self.dtype)
 
-        self.num_gpus = torch.cuda.device_count() if self.device_map == 'auto' else 1
-        if self.device_map == 'auto' and self.num_gpus == 1:
-            self.device_map = 'cuda:0'
-        
-        if self.device_map != "auto":   # single GPUs
-            self.layer_mapping = {}
-            for ldx in range(0, self.num_layers):
-                self.layer_mapping.update({str(ldx): self.device_map})
+        self.layer_mapping = {}
+        for ldx in range(0, self.num_layers):
+            self.layer_mapping.update({str(ldx): self.device_map})
 
-            self.embed_tokens = hf_llama.model.embed_tokens.weight.detach().to(self.device_map, non_blocking=True)
-            self.lm_head = hf_llama.lm_head.weight.detach().to(self.device_map, non_blocking=True)
+        self.embed_tokens = hf_llama.model.embed_tokens.weight.detach().to(self.device_map, non_blocking=True)
+        self.lm_head = hf_llama.lm_head.weight.detach().to(self.device_map, non_blocking=True)
 
-            self.norm_weight = hf_llama.model.norm.weight.detach().to(self.device_map, non_blocking=True)
-            self.norm_variance_epsilon = hf_llama.model.norm.variance_epsilon
+        self.norm_weight = hf_llama.model.norm.weight.detach().to(self.device_map, non_blocking=True)
+        self.norm_variance_epsilon = hf_llama.model.norm.variance_epsilon
 
-            self.position_ids = torch.arange(0, self.max_length).to(self.device_map, non_blocking=True)
-            self.inv_freq = hf_llama.model.rotary_emb.inv_freq.detach().to(self.device_map, non_blocking=True)
-            self.attention_scaling = hf_llama.model.rotary_emb.attention_scaling
-            self.cos_cache, self.sin_cache = self._set_cos_sin_cache()
-            self.cos_sin_cache = torch.cat((self.cos_cache, self.sin_cache), dim=-1)
+        self.position_ids = torch.arange(0, self.max_length).to(self.device_map, non_blocking=True)
+        self.inv_freq = hf_llama.model.rotary_emb.inv_freq.detach().to(self.device_map, non_blocking=True)
+        self.attention_scaling = hf_llama.model.rotary_emb.attention_scaling
+        self.cos_cache, self.sin_cache = self._set_cos_sin_cache()
+        self.cos_sin_cache = torch.cat((self.cos_cache, self.sin_cache), dim=-1)
 
-            self.layers = []
-            for idx, hf_llama_layer in enumerate(hf_llama.model.layers):
-                llama_layer = LlamaLayer(idx, device=self.device_map)
-                llama_layer.init_layer(hf_llama_layer)
-                self.layers.append(llama_layer)
-                hf_llama.model.layers[idx] = None
-
-        else:                         # multi GPUs
-            self.gpu_ids = list(range(self.num_gpus))
-            self.layer_interval = (self.num_layers + self.num_gpus - 1) // self.num_gpus
-            self.layer_mapping = {}
-            for ldx in range(0, self.num_layers):
-                self.layer_mapping.update({str(ldx): f'cuda:{ldx // self.layer_interval}'})
-
-            self.embed_tokens = hf_llama.model.embed_tokens.weight.detach().to(f'cuda:{self.gpu_ids[0]}', non_blocking=True)
-            self.lm_head = hf_llama.lm_head.weight.detach().to(f'cuda:{self.gpu_ids[0]}', non_blocking=True)
-
-            self.norm_weight = hf_llama.model.norm.weight.detach().to(f'cuda:{self.gpu_ids[0]}', non_blocking=True)
-            self.norm_variance_epsilon = hf_llama.model.norm.variance_epsilon
-
-            self.position_ids = torch.arange(0, self.max_length).to(f'cuda:{self.gpu_ids[0]}', non_blocking=True)
-            self.inv_freq = hf_llama.model.rotary_emb.inv_freq.detach().to(f'cuda:{self.gpu_ids[0]}', non_blocking=True)
-            self.attention_scaling = hf_llama.model.rotary_emb.attention_scaling
-            self.cos_cache, self.sin_cache = self._set_cos_sin_cache()
-            self.cos_sin_cache = torch.cat((self.cos_cache, self.sin_cache), dim=-1)
-
-            self.layers = []
-            for ldx, hf_llama_layer in enumerate(hf_llama.model.layers):
-                llama_layer = LlamaLayer(ldx, device=self.layer_mapping[str(ldx)])
-                llama_layer.init_layer(hf_llama_layer)
-                self.layers.append(llama_layer)
-                hf_llama.model.layers[ldx] = None
+        self.layers = []
+        for idx, hf_llama_layer in enumerate(hf_llama.model.layers):
+            llama_layer = LlamaLayer(idx, device=self.device_map)
+            llama_layer.init_layer(hf_llama_layer)
+            self.layers.append(llama_layer)
+            hf_llama.model.layers[idx] = None
 
         del self.inv_freq, self.cos_cache, self.sin_cache
         gc.collect()
@@ -153,26 +121,55 @@ class LlamaModel(BaseModel):
             config = attn_config
         
         # Init kv cache
+        r_sq = self.calc_r_sq()
         self.kv_cache = DiffCache(
-            layer_num = self.num_layers,
+            num_layers = self.num_layers,
             batch_size = self.batch_size,
             max_length = self.max_new_length + real_input_length,
             num_kv_heads = self.num_key_value_heads,
             num_q_heads = self.num_heads,
             head_dim = self.head_dim,
             index_layer_prob = config["index_layer_prob"],
+            max_index_layer_sz = config["max_index_layer_sz"],
+            group_query = config["group_query"],
+            nsw_m = config["nsw_m"],
+            nsw_ef_cons = config["nsw_ef_cons"],
+            r_sq = r_sq,
+            cpu_thread_pool_size = config["cpu_thread_pool_size"],
             minibatch_size = config["minibatch_size"],
             num_seeds = config["num_seeds"],
             retrieval_budget = config["retrieval_budget"],
-            dtype = self.dtype,
-            layer_mapping = self.layer_mapping,
-            num_gpus = self.num_gpus,
         )
+        print(f"KVCache init, r_sq={r_sq}")
 
-    
-    def move(self):
-        # TODO: multi-gpu support
-        pass
+
+    def calc_r_sq(self):
+        r_sq = []
+        dim = self.hidden_size
+
+        for layer in self.layers:
+            norm_weight = layer.input_layernorm_weight.float()
+            wk_all = layer.wqkv[self.hidden_size:2*self.hidden_size, :]
+            wk_heads = wk_all.view(self.num_key_value_heads, self.head_dim, self.hidden_size)
+
+            layer_max_sigma_sq = 0.0
+            for head_idx in range(self.num_key_value_heads):
+                # ||k|| = ||xWk|| <= ||Wk . Diag(gamma)|| . ||RMSNorm(x')||
+                head_weight = wk_heads[head_idx].float()
+                scaled = head_weight * norm_weight          # S = Wk . Diag(gamma)
+                gram = scaled @ scaled.transpose(0, 1)      # G = SS^T
+                gram = 0.5 * (gram + gram.transpose(0, 1))  # G = 0.5 * (SS^T + SS^T^T)
+                gram_cpu = gram.cpu().double()           
+                sigma_sq = torch.linalg.eigvalsh(gram_cpu).amax().item()
+                sigma_sq = max(sigma_sq, 0.0)
+                layer_max_sigma_sq = max(layer_max_sigma_sq, sigma_sq)
+
+                del head_weight, scaled, gram, gram_cpu
+
+            r_sq.append(float(dim * layer_max_sigma_sq))
+            del norm_weight, wk_all, wk_heads
+
+        return r_sq
 
     
     def word_embedding(self, inputs_id):
@@ -218,13 +215,8 @@ class LlamaModel(BaseModel):
         flashinfer.activation.silu_and_mul(hidden_states, out)
         hidden_states = F.linear(out, layer.down_proj)
         return hidden_states 
-
     
-    def parameter_move(self, hidden_states, ldx):
-        # TODO: multi-gpu support
-        pass
 
-    
     def layernorm(self, hidden_states, epsilon, weight):
         bsz, seq_len, dim = hidden_states.shape
         hidden_states = hidden_states.reshape(bsz * seq_len, dim)
@@ -244,11 +236,11 @@ class LlamaModel(BaseModel):
         return query_states, key_states
 
 
-    def position_embedd(self, query_states, key_states):
+    def position_embedd(self, query_states, key_states, cached_seq_len):
         bsz, seq_len, _ = key_states.shape
 
-        position_ids = self.position_ids[self.kv_cache.context:self.kv_cache.context+seq_len].unsqueeze(0).repeat(bsz, 1)
-        
+        position_ids = self.position_ids[cached_seq_len:cached_seq_len+seq_len].unsqueeze(0).repeat(bsz, 1)
+
         query_states, key_states = self.apply_rotary_pos_emb(query_states, key_states, position_ids)
 
         return query_states, key_states
