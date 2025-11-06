@@ -1,0 +1,13 @@
+{
+    "RetroInfer": {
+        "static_pattern_start": 4,
+        "static_pattern_end": 64,
+        "core": 22,
+        "n_centroids": 8192,
+        "n_segment": 16,
+        "nprobe": 150,
+        "max_compute_cluster_num": 2048,
+        "cache_unit_size": 8,
+        "cache_cluster_num": 450
+    }
+}
