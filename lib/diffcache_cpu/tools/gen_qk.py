@@ -30,7 +30,16 @@ def make_qk_hook(store, head_idx):
 
 def main():
     model_name = 'Qwen/Qwen2.5-7B-Instruct'
-    model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.bfloat16, device_map='cuda')
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name, 
+        dtype=torch.bfloat16, 
+        device_map='cuda',
+        rope_scaling={
+            "type": "yarn",
+            "factor": 4.0,
+            "original_max_position_embeddings": 32768,
+        },
+    )
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     # add hook

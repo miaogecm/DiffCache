@@ -96,7 +96,12 @@ def main():
         args.model_name,
         torch_dtype=dtype,
         device_map=args.device_map,
-        trust_remote_code=True
+        trust_remote_code=True,
+        rope_scaling={
+            "type": "yarn",
+            "factor": 4.0,
+            "original_max_position_embeddings": 32768,
+        },
     )
     model.eval()
 
