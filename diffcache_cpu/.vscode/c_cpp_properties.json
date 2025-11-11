@@ -1,0 +1,20 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/target/cxxbridge",
+                "${workspaceFolder}/cuvs/cpp/build/install/include",
+                "${workspaceFolder}/cuvs/cpp/build/_deps/rmm-src/cpp/include",
+                "${workspaceFolder}/cuvs/cpp/build/_deps/raft-src/cpp/include",
+                "/usr/local/cuda/include"
+            ],
+            "defines": [],
+            "compilerPath": "/usr/bin/g++-13",
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "linux-clang-x64"
+        }
+    ],
+    "version": 4
+}

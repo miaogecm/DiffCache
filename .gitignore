@@ -123,3 +123,4 @@ Temporary Items
 venv
 .venv
 __pycache__
+.data

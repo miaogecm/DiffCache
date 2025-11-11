@@ -1,0 +1,11 @@
+{
+    "index_layer_prob": 0.03125,
+    "minibatch_size": 1,
+    "num_seeds": 128,
+    "retrieval_budget": 1000,
+    "max_index_layer_sz": 65536,
+    "group_query": true,
+    "nsw_m": 16,
+    "nsw_ef_cons": 200,
+    "cpu_thread_pool_size": 8
+}

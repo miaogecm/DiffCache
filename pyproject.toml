@@ -1,0 +1,16 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "diffcache"
+version = "0.1.0"
+description = "DiffCache"
+requires-python = ">=3.8"
+readme = "README.md"
+
+[tool.maturin]
+bindings = "pyo3"
+python-source = "src"
+module-name = "diffcache._cpu"
+manifest-path = "diffcache_cpu/Cargo.toml"
