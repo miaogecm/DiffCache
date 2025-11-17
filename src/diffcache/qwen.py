@@ -76,53 +76,32 @@ class QwenModel(BaseModel):
 
         self.init_model()
 
-    
+
     def _set_cos_sin_cache(self):
-        if self.max_length > 32768:
-            def find_correction_dim(num_rotations, dim, base, max_position_embeddings):
-                """Inverse dimension formula to find the dimension based on the number of rotations"""
-                return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (2 * math.log(base))
+        device = self.device_map
+        device_type = "cuda" if "cuda" in str(device) else "cpu"
 
-            def find_correction_range(low_rot, high_rot, dim, base, max_position_embeddings):
-                """Find dimension range bounds based on rotations"""
-                low = math.floor(find_correction_dim(low_rot, dim, base, max_position_embeddings))
-                high = math.ceil(find_correction_dim(high_rot, dim, base, max_position_embeddings))
-                return max(low, 0), min(high, dim - 1)
+        t = torch.arange(self.max_length, device=device, dtype=torch.float32)
+        inv_freq = self.inv_freq.to(torch.float32)
 
-            def linear_ramp_factor(min, max, dim):
-                if min == max:
-                    max += 0.001  # Prevent singularity
+        with torch.autocast(device_type=device_type, enabled=False):        # force float32
+            freqs = torch.outer(t, inv_freq)
+            cos = freqs.cos() * float(self.attention_scaling)
+            sin = freqs.sin() * float(self.attention_scaling)
 
-                linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
-                ramp_func = torch.clamp(linear_func, 0, 1)
-                return ramp_func
-            
-            attention_factor = 0.1 * math.log(self.yarn_factor) + 1.0
-            beta_fast = 32
-            beta_slow = 1
-
-            pos_freqs = self.base ** (torch.arange(0, self.head_dim, 2).float().to(self.inv_freq.device) / self.head_dim)
-            inv_freq_extrapolation = 1.0 / pos_freqs
-            inv_freq_interpolation = 1.0 / (self.yarn_factor * pos_freqs)
-
-            low, high = find_correction_range(beta_fast, beta_slow, self.head_dim, self.base, self.max_position_embeddings)
-
-            inv_freq_extrapolation_factor = 1 - linear_ramp_factor(low, high, self.head_dim // 2).float().to(self.inv_freq.device)
-            inv_freq = (
-                inv_freq_interpolation * (1 - inv_freq_extrapolation_factor)
-                + inv_freq_extrapolation * inv_freq_extrapolation_factor
-            )
-
-            self.inv_freq = inv_freq
-            self.attention_scaling = attention_factor
-
-        t = torch.arange(self.max_length, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
-        return freqs.cos()*self.attention_scaling, freqs.sin()*self.attention_scaling
+        return cos, sin
 
 
     def init_model(self):
-        hf_qwen = Qwen2ForCausalLM.from_pretrained(self.model_name, torch_dtype=self.dtype)
+        hf_qwen = Qwen2ForCausalLM.from_pretrained(
+            self.model_name, 
+            torch_dtype=self.dtype,
+            rope_scaling={
+                "type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 32768,
+            },
+        )
 
         self.embed_tokens = hf_qwen.model.embed_tokens.weight.detach().to(self.device_map, non_blocking=True)
         self.lm_head = hf_qwen.lm_head.weight.detach().to(self.device_map, non_blocking=True)
@@ -159,6 +138,8 @@ class QwenModel(BaseModel):
                 config = json.load(f)
         else:
             config = attn_config
+
+        print(f"prompt_len={real_input_length} gen_max_len={self.max_new_length}")
         
         # Init kv cache
         r_sq = self.calc_r_sq()
@@ -171,14 +152,15 @@ class QwenModel(BaseModel):
             head_dim = self.head_dim,
             index_layer_prob = config["index_layer_prob"],
             max_index_layer_sz = config["max_index_layer_sz"],
-            group_query = config["group_query"],
             nsw_m = config["nsw_m"],
             nsw_ef_cons = config["nsw_ef_cons"],
             r_sq = r_sq,
-            cpu_thread_pool_size = config["cpu_thread_pool_size"],
             minibatch_size = config["minibatch_size"],
             num_seeds = config["num_seeds"],
             retrieval_budget = config["retrieval_budget"],
+            batch_prefill = config["batch_prefill"],
+            prefix_kvcache_len = config["prefix_kvcache_len"],
+            suffix_kvcache_len = config["suffix_kvcache_len"]
         )
         print(f"KVCache init, r_sq={r_sq}")
 
@@ -284,7 +266,8 @@ class QwenModel(BaseModel):
         _, _, kv_dim = key_states.shape
         query_states = query_states.view(-1, hidden_dim)
         key_states = key_states.view(-1, kv_dim)
-        flashinfer.rope.apply_rope_with_cos_sin_cache_inplace(position_ids, query_states, key_states, self.head_dim, self.cos_sin_cache, True)
+        positions = position_ids.reshape(-1).contiguous()
+        flashinfer.rope.apply_rope_with_cos_sin_cache_inplace(positions, query_states, key_states, self.head_dim, self.cos_sin_cache, True)
         query_states = query_states.view(bsz, -1, hidden_dim)
         key_states = key_states.view(bsz, -1, kv_dim)
         return query_states, key_states

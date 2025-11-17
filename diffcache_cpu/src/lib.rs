@@ -16,13 +16,12 @@
 //! 
 //! (2) query(self, Q, ef, ep)                   (Q:  (bsz,     q_head_num , head_dim))
 //!                                              (ep: (bsz,     kv_head_num, num_seeds))
-//!                                 (ret: (K, V) with (bsz, ef, kv_head_num, head_dim)) with group_query enabled
-//!                                 (ret: (K, V) with (bsz, ef, q_head_num , head_dim)) without group_query
+//!                                 (ret: (K, V) with (bsz, ef, kv_head_num, head_dim))
 //!     Query the cache with Q to retrieve top ef relevant KVs
 //! 
 #![feature(portable_simd, pointer_is_aligned_to, core_intrinsics, stmt_expr_attributes, iterator_try_collect)]
 
-use std::{ops::{Deref, DerefMut}, sync::{atomic::AtomicBool, Arc}};
+use std::{ops::{Add, Deref, DerefMut, Div}, sync::{Arc, atomic::{AtomicBool, AtomicUsize}}};
 use ndarray::{Array, Array2, Array4, ArrayView, ArrayView2, ArrayView3, ArrayView4, Data, Dimension, ShapeBuilder, s};
 use numpy::{IntoPyArray, PyArray3, PyArray4, PyReadonlyArray3, PyReadonlyArray4};
 use rand::rand_core::le;
@@ -31,6 +30,10 @@ use std::sync::RwLock;
 use threadpool::{ThreadPool, Builder};
 use crossbeam::channel;
 use pyo3::{prelude::*, types::PyDict};
+use metrics_exporter_tcp::TcpBuilder;
+use std::cell::Cell;
+use core_affinity;
+use std::sync::LazyLock;
 
 mod tlset;
 mod nsw;
@@ -38,6 +41,28 @@ mod nsw;
 pub type Distance = f32;
 
 type NodeID = u32;
+
+thread_local! {
+    static AFFINITY_SET: Cell<bool> = Cell::new(false);
+}
+
+static NEXT_CORE: AtomicUsize = AtomicUsize::new(0);
+
+static THREAD_POOL: LazyLock<ThreadPool> = LazyLock::new(|| Builder::new()
+                                                            .num_threads(4)
+                                                            .build());
+
+fn try_bind_core() {
+    AFFINITY_SET.with(|affinity_set| {
+        if !affinity_set.get() {
+            let cores = core_affinity::get_core_ids().unwrap();
+            let core_id = NEXT_CORE.fetch_add(1, std::sync::atomic::Ordering::SeqCst) % cores.len();
+            core_affinity::set_for_current(cores[core_id]);
+            println!("Binding thread {:?} to core {:?}", std::thread::current().id(), cores[core_id]);
+            affinity_set.set(true);
+        }
+    });
+}
 
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
@@ -54,6 +79,10 @@ pub trait L2Square {
     fn l2sq(a: &[Self], b: &[Self]) -> f32 where Self: Sized;
 }
 
+pub trait Mean {
+    fn mean(vecs: &[Self], out: &mut [Self]) where Self: Sized;
+}
+
 impl InnerProduct for bf16 {
     fn dot(a: &[Self], b: &[Self]) -> f32 where Self: Sized {
         SpatialSimilarity::dot(a, b).unwrap() as f32
@@ -63,6 +92,22 @@ impl InnerProduct for bf16 {
 impl L2Square for bf16 {
     fn l2sq(a: &[Self], b: &[Self]) -> f32 where Self: Sized {
         SpatialSimilarity::l2sq(a, b).unwrap() as f32
+    }
+}
+
+impl Mean for bf16 {
+    fn mean(vecs: &[Self], out: &mut [Self]) where Self: Sized {
+        let dim = out.len();
+        let n = vecs.len() / dim;
+        let acc = vecs.chunks(dim).fold(vec![0.0f32; dim], |mut acc, v| {
+            for i in 0..dim {
+                acc[i] += bf16::to_f32(v[i]);
+            }
+            acc
+        });
+        for i in 0..dim {
+            out[i] = bf16::from_f32(acc[i] / n as f32);
+        }
     }
 }
 
@@ -170,10 +215,10 @@ pub struct Options {
     max_ctx_len: usize,
     m: usize,
     ef_cons: usize,
-    thread_pool_size: usize,
     r_sq: Vec<f32>,
-    group_query: bool,
-    batch_search: bool
+    batch_search: bool,
+    name: String,
+    use_bruteforce: bool
 }
 
 pub struct DataLayer<T: Clone> {
@@ -184,21 +229,19 @@ pub struct DataLayer<T: Clone> {
     q_head_num: usize,                                   // number of Q heads
     head_dim: usize,                                     // dimension per head
     opt: Options,
-    thread_pool: Arc<ThreadPool>,
 }
 
 pub struct Handle<R> {
-    thread_pool: Arc<ThreadPool>,
     result: R,
 }
 
 impl<R> Handle<R> {
     pub fn completed(&self) -> bool {
-        self.thread_pool.queued_count() == 0 && self.thread_pool.active_count() == 0
+        THREAD_POOL.queued_count() == 0 && THREAD_POOL.active_count() == 0
     }
 
     pub fn result(self) -> R {
-        self.thread_pool.join();
+        THREAD_POOL.join();
         self.result
     }
 }
@@ -221,6 +264,8 @@ impl<T: Clone + Copy + Value> QueryResult<T> {
 
         for _ in 0..self.bsz*self.head_num {
             let (b, kh, k_ret, v_ret) = self.rx.recv().unwrap();
+            assert!(k_ret.shape() == &[self.ef, self.head_dim]);
+            assert!(v_ret.shape() == &[self.ef, self.head_dim]);
             keys.slice_mut(s![b, .., kh, ..]).assign(&k_ret);
             vals.slice_mut(s![b, .., kh, ..]).assign(&v_ret);
         }
@@ -231,7 +276,7 @@ impl<T: Clone + Copy + Value> QueryResult<T> {
     }
 }
 
-impl<T: 'static + Send + Sync + Clone + Value + Copy + InnerProduct + L2Square> DataLayer<T> {
+impl<T: 'static + Send + Sync + Clone + Value + Copy + InnerProduct + L2Square + Mean> DataLayer<T> {
     pub fn new(bsz: usize, q_head_num: usize, kv_head_num: usize, head_dim: usize, opt: Options) -> Self {
         assert!(q_head_num % kv_head_num == 0, "q_head_num must be multiple of kv_head_num");
 
@@ -247,17 +292,14 @@ impl<T: 'static + Send + Sync + Clone + Value + Copy + InnerProduct + L2Square> 
                         n_max: opt.max_ctx_len,
                         m: opt.m,
                         ef_cons: opt.ef_cons,
-                        r_sq: opt.r_sq[h]
+                        r_sq: opt.r_sq[h],
+                        name: format!("{}b{:03}h{:03}", opt.name, indexes.len(), h),
                     }
                 ))));
             }
 
             indexes.push(batch_indexes);
         }
-
-        let thread_pool = Arc::new(Builder::new()
-            .num_threads(opt.thread_pool_size)
-            .build());
 
         DataLayer {
             indexes,
@@ -266,8 +308,7 @@ impl<T: 'static + Send + Sync + Clone + Value + Copy + InnerProduct + L2Square> 
             kv_head_num,
             q_head_num,
             head_dim,
-            opt,
-            thread_pool
+            opt
         }
     }
 
@@ -280,6 +321,8 @@ impl<T: 'static + Send + Sync + Clone + Value + Copy + InnerProduct + L2Square> 
         assert_eq!(keys.shape(), &[self.bsz, seq_len, self.kv_head_num, self.head_dim]);
         assert_eq!(vals.shape(), &[self.bsz, seq_len, self.kv_head_num, self.head_dim]);
 
+        self.ctx_len = seq_len;
+
         for b in 0..self.bsz {
             for kh in 0..self.kv_head_num {
                 let index = self.indexes[b][kh].clone();
@@ -287,7 +330,7 @@ impl<T: 'static + Send + Sync + Clone + Value + Copy + InnerProduct + L2Square> 
                 let vals = vals.slice(s![b, .., kh, ..]).to_owned();
                 let neighbours = neighbours.slice(s![b, kh, .., ..]).to_owned();
 
-                self.thread_pool.execute(move || {
+                THREAD_POOL.execute(move || {
                     let mut index = index.write().unwrap();
                     index.prefill(keys.view(), vals.view(), neighbours.view()).unwrap();
                 });
@@ -295,7 +338,6 @@ impl<T: 'static + Send + Sync + Clone + Value + Copy + InnerProduct + L2Square> 
         }
 
         Handle {
-            thread_pool: self.thread_pool.clone(),
             result: InsertResult,
         }
     }
@@ -321,7 +363,7 @@ impl<T: 'static + Send + Sync + Clone + Value + Copy + InnerProduct + L2Square> 
                 let val = vals.slice(s![b, kh, ..]).to_owned();
                 let ep = ep.slice(s![b, kh, ..]).to_owned();
 
-                self.thread_pool.execute(move || {
+                THREAD_POOL.execute(move || {
                     let mut index = index.write().unwrap();
                     index.insert(node_id, key.view(), val.view(), ep.view()).unwrap();
                 });
@@ -329,62 +371,47 @@ impl<T: 'static + Send + Sync + Clone + Value + Copy + InnerProduct + L2Square> 
         }
 
         Handle {
-            thread_pool: self.thread_pool.clone(),
             result: InsertResult,
         }
     }
 
     // queries: (bsz, q_head_num, head_dim)
-    // ep:      (bsz, kv_head_num, num_seeds) for group_query
-    //          (bsz, q_head_num,  num_seeds) for non-group_query
+    // ep:      (bsz, kv_head_num, num_seeds)
     pub fn query(&self, queries: ArrayView3<T>, ef: usize, ep: ArrayView3<Neighbour>) -> Handle<QueryResult<T>> {
         let num_seeds = ep.shape()[2];
 
         assert_eq!(queries.shape(), &[self.bsz, self.q_head_num, self.head_dim]);
-        if self.opt.group_query {
-            assert_eq!(ep.shape(), &[self.bsz, self.kv_head_num, num_seeds]);
-        } else {
-            assert_eq!(ep.shape(), &[self.bsz, self.q_head_num, num_seeds]);
-        }
+        assert_eq!(ep.shape(), &[self.bsz, self.kv_head_num, num_seeds]);
 
         let group_size = self.q_head_num / self.kv_head_num;
 
         let (tx, rx) = channel::unbounded();
 
+        let search_bruteforce = self.opt.use_bruteforce;
+
         for b in 0..self.bsz {
             for kh in 0..self.kv_head_num {
-                if self.opt.group_query {
-                    let index = self.indexes[b][kh].clone();
-                    let ep = ep.slice(s![b, kh, ..]).to_owned();
-                    let tx = tx.clone();
-                    let query = queries.slice(s![b, kh*group_size..(kh+1)*group_size, ..]).to_owned();
-                    self.thread_pool.execute(move || {
-                        let index = index.read().unwrap();
-                        let (k_ret, v_ret) = index.search(query.view(), ef, ep.view());
-                        tx.send((b, kh, k_ret, v_ret)).unwrap();
-                    });
-                } else {
-                    for qh in 0..group_size {
-                        let index = self.indexes[b][kh].clone();
-                        let ep = ep.slice(s![b, kh*group_size+qh, ..]).to_owned();
-                        let tx = tx.clone();
-                        let query = queries.slice(s![b, kh*group_size+qh, ..]).to_owned().insert_axis(ndarray::Axis(0));
-                        self.thread_pool.execute(move || {
-                            let index = index.read().unwrap();
-                            let (k_ret, v_ret) = index.search(query.view(), ef, ep.view());
-                            tx.send((b, kh * group_size + qh, k_ret, v_ret)).unwrap();
-                        });
-                    }
-                }
+                let index = self.indexes[b][kh].clone();
+                let ep = ep.slice(s![b, kh, ..]).to_owned();
+                let tx = tx.clone();
+                let query = queries.slice(s![b, kh*group_size..(kh+1)*group_size, ..]).to_owned();
+                THREAD_POOL.execute(move || {
+                    let index = index.read().unwrap();
+                    let (k_ret, v_ret) = if !search_bruteforce {
+                        index.search(query.view(), ef, ep.view())
+                    } else {
+                        index.search_bruteforce(query.view(), ef)
+                    };
+                    tx.send((b, kh, k_ret, v_ret)).unwrap();
+                });
             }
         }
 
         Handle {
-            thread_pool: self.thread_pool.clone(),
             result: QueryResult {
                 rx,
                 bsz: self.bsz,
-                head_num: if self.opt.group_query { self.kv_head_num } else { self.q_head_num },
+                head_num: self.kv_head_num,
                 ef,
                 head_dim: self.head_dim
             },
@@ -394,7 +421,7 @@ impl<T: 'static + Send + Sync + Clone + Value + Copy + InnerProduct + L2Square> 
     pub fn save(&self, prefix: &str) {
         for b in 0..self.bsz {
             for kh in 0..self.kv_head_num {
-                self.thread_pool.execute({
+                THREAD_POOL.execute({
                     let index = self.indexes[b][kh].clone();
                     let path = format!("{}b{:03}_h{:03}.idx", prefix, b, kh);
                     move || {
@@ -406,10 +433,11 @@ impl<T: 'static + Send + Sync + Clone + Value + Copy + InnerProduct + L2Square> 
         }
     }
 
-    pub fn load(&mut self, prefix: &str) {
+    pub fn load(&mut self, prefix: &str, ctx_len: usize) {
+        self.ctx_len = ctx_len;
         for b in 0..self.bsz {
             for kh in 0..self.kv_head_num {
-                self.thread_pool.execute({
+                THREAD_POOL.execute({
                     let index = self.indexes[b][kh].clone();
                     let path = format!("{}b{:03}_h{:03}.idx", prefix, b, kh);
                     move || {
@@ -422,14 +450,14 @@ impl<T: 'static + Send + Sync + Clone + Value + Copy + InnerProduct + L2Square> 
     }
 
     pub fn get_keys(&self) -> Array4<T> {
-        let mut keys = Array4::<T>::from_elem((self.bsz, self.ctx_len, self.kv_head_num, self.head_dim), T::zero());
+        let mut keys = Array4::<T>::from_elem((self.bsz, self.kv_head_num, self.ctx_len, self.head_dim), T::zero());
         
         for b in 0..self.bsz {
             for kh in 0..self.kv_head_num {
                 let index = self.indexes[b][kh].clone();
                 let index = index.read().unwrap();
                 let key_view = index.get_keys(self.ctx_len);
-                keys.slice_mut(s![b, .., kh, ..]).assign(&key_view);
+                keys.slice_mut(s![b, kh, .., ..]).assign(&key_view);
             }
         }
 
@@ -472,6 +500,11 @@ fn owned_bf16_to_u16<D: Dimension>(a: Array<bf16, D>) -> Array<u16, D> {
     Array::from_shape_vec(shape, unsafe { Vec::from_raw_parts(ptr, len, cap) }).unwrap()
 }
 
+fn setup_metrics() {
+    let builder = TcpBuilder::new();
+    builder.install().expect("failed to install TCP exporter");
+}
+
 #[pymethods]
 impl DiffCacheCPU {
     #[new]
@@ -481,10 +514,10 @@ impl DiffCacheCPU {
             max_ctx_len: 1000000,
             m: 16,
             ef_cons: 200,
-            thread_pool_size: 16,
             r_sq: [4.0].repeat(kv_head_num),
-            group_query: true,
-            batch_search: false
+            batch_search: false,
+            name: "l0".into(),
+            use_bruteforce: true
         };
         if let Some(dict) = kwargs {
             for (key, value) in dict.iter() {
@@ -492,10 +525,9 @@ impl DiffCacheCPU {
                     k if k == "max_ctx_len" => opt.max_ctx_len = value.extract::<usize>().unwrap(),
                     k if k == "m" => opt.m = value.extract::<usize>().unwrap(),
                     k if k == "ef_cons" => opt.ef_cons = value.extract::<usize>().unwrap(),
-                    k if k == "thread_pool_size" => opt.thread_pool_size = value.extract::<usize>().unwrap(),
                     k if k == "r_sq" => opt.r_sq = value.extract::<Vec<f32>>().unwrap(),
-                    k if k == "group_query" => opt.group_query = value.extract::<bool>().unwrap(),
                     k if k == "batch_search" => opt.batch_search = value.extract::<bool>().unwrap(),
+                    k if k == "name" => opt.name = value.extract::<String>().unwrap(),
                     _ => panic!("Unknown option {key}"),
                 }
             }
@@ -566,20 +598,19 @@ impl DiffCacheCPU {
     }
 
     fn wait(&mut self) {
-        self.data_layer.thread_pool.join();
+        THREAD_POOL.join();
     }
 
     fn save(&self, path: &str) {
         self.data_layer.save(path);
     }
 
-    fn load(&mut self, path: &str) {
-        self.data_layer.load(path);
+    fn load(&mut self, path: &str, ctx_len: usize) {
+        self.data_layer.load(path, ctx_len);
     }
 
-    fn get_keys<'py>(&self, py: Python<'py>) -> Py<PyArray4<u16>> {
-        let keys = self.data_layer.get_keys();
-        let keys = owned_bf16_to_u16(keys);
+    fn get_keys<'py>(&self, py: Python<'py>) -> Py<PyArray4<f32>> {
+        let keys = self.data_layer.get_keys().mapv(|x| x.to_f32());
         keys.into_pyarray(py).into()
     }
 }
@@ -612,10 +643,16 @@ impl QueryHandle {
     }
 }
 
+#[pyfunction]
+fn init_metrics() {
+    setup_metrics();
+}
+
 #[pymodule]
 fn _cpu(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DiffCacheCPU>()?;
     m.add_class::<InsertHandle>()?;
     m.add_class::<QueryHandle>()?;
+    m.add_function(wrap_pyfunction!(init_metrics, m)?)?;
     Ok(())
 }

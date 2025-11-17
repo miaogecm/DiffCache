@@ -16,9 +16,12 @@ core_affinity = "0.8.3"
 hugepage-rs = "0.1.0"
 futures = "0.3.31"
 ndarray = "0.16.1"
+ndarray-npy = "0.9.1"
 crossbeam = "0.8.4"
 numpy = "0.27.0"
 pyo3 = { version = "0.27.1", features = ["extension-module"] }
+metrics = "0.24.2"
+metrics-exporter-tcp = "0.11.1"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["disable_initial_exec_tls"] }

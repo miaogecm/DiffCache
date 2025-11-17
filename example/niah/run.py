@@ -7,6 +7,8 @@ import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from diffcache import LlamaModel, QwenModel
+from codetiming import Timer
+import atexit
 
 
 def insert_needle(text: str, needle: str, ratio: float) -> str:
@@ -37,7 +39,7 @@ def main():
     parser.add_argument("--needle_ratio", type=float, default=0.5, help="Insertion ratio in [0,1].")
     parser.add_argument("--needle_text", type=str, default="[[[NEEDLE: The secret verification code is JUPITER-19.]]]")
     parser.add_argument("--question_prefix", type=str, default="Return only the hidden verification code. Here is the book:\n")
-    parser.add_argument("--max_gen_len", type=int, default=1024)
+    parser.add_argument("--max_gen_len", type=int, default=32)
     args = parser.parse_args()
 
     # Load and inject needle
@@ -72,5 +74,15 @@ def main():
     print(result)
 
 
+def print_stats():
+    print("Timers summary:")
+    for name in Timer.timers.data.keys():
+        total = Timer.timers.total(name)
+        count = Timer.timers.count(name)
+        mean = Timer.timers.mean(name)
+        print(f"  {name}: total {total:.4f}s over {count} runs (mean {mean:.4f}s)")
+
+
 if __name__ == "__main__":
+    atexit.register(print_stats)
     main()

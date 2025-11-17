@@ -130,16 +130,17 @@ class LlamaModel(BaseModel):
             head_dim = self.head_dim,
             index_layer_prob = config["index_layer_prob"],
             max_index_layer_sz = config["max_index_layer_sz"],
-            group_query = config["group_query"],
             nsw_m = config["nsw_m"],
             nsw_ef_cons = config["nsw_ef_cons"],
             r_sq = r_sq,
-            cpu_thread_pool_size = config["cpu_thread_pool_size"],
             minibatch_size = config["minibatch_size"],
             num_seeds = config["num_seeds"],
             retrieval_budget = config["retrieval_budget"],
+            batch_prefill = config["batch_prefill"],
+            prefix_kvcache_len = config["prefix_kvcache_len"],
+            suffix_kvcache_len = config["suffix_kvcache_len"]
         )
-        print(f"KVCache init, r_sq={r_sq}")
+        print(f"KVCache init")
 
 
     def calc_r_sq(self):

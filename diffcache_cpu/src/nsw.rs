@@ -1,9 +1,10 @@
-use crate::{Distance, HugeArray, L2Square, Neighbour, NodeID};
-use std::{array, cmp::{min, Reverse}, collections::BinaryHeap, intrinsics::{prefetch_read_data, sqrtf32}, io::{BufReader, BufWriter}, iter::repeat_with, marker::PhantomData, path::Path, sync::atomic::Ordering, time::Instant};
+use crate::{Distance, HugeArray, L2Square, Mean, Neighbour, NodeID};
+use std::{array, cmp::{Reverse, max, min}, collections::{BinaryHeap, HashSet}, f32, intrinsics::{prefetch_read_data, sqrtf32}, io::{BufReader, BufWriter}, iter::repeat_with, marker::PhantomData, ops::{Add, Div}, path::Path, sync::atomic::Ordering, time::Instant};
 use crate::{Value};
 use std::cell::RefCell;
 use super::tlset::TLSet;
-use ndarray::{s, Array2, ArrayView1, ArrayView2};
+use metrics::counter;
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use serde::{Deserialize, Serialize};
 use simsimd::SpatialSimilarity;
 use std::sync::atomic::AtomicUsize;
@@ -19,6 +20,7 @@ pub struct Options {
     pub ef_cons: usize,
     pub n_max: usize,      // maximum number of nodes
     pub r_sq: f32,
+    pub name: String
 }
 
 #[derive(Clone, Debug)]
@@ -34,27 +36,6 @@ struct Node<T: Clone> {
     edges: [NodeID; MAX_NUM_NEIGHBOURS],      // 128B (4B * 32)
     phantom: PhantomData<T>
 }
-pub struct Statistic {
-    pub num_searches: AtomicUsize,
-    pub search_latency: AtomicUsize,
-    pub num_expanded_nodes: AtomicUsize,
-    pub num_candidates_raw: AtomicUsize,
-    pub num_candidates_unvisited: AtomicUsize,
-    pub num_candidates_pruned: AtomicUsize,
-}
-
-impl Statistic {
-    fn new() -> Self {
-        Statistic {
-            num_searches: AtomicUsize::new(0),
-            search_latency: AtomicUsize::new(0),
-            num_expanded_nodes: AtomicUsize::new(0),
-            num_candidates_raw: AtomicUsize::new(0),
-            num_candidates_unvisited: AtomicUsize::new(0),
-            num_candidates_pruned: AtomicUsize::new(0),
-        }
-    }
-}
 
 pub struct Index<T: Clone> {
     nodes: HugeArray<Node<T>>,
@@ -64,7 +45,6 @@ pub struct Index<T: Clone> {
     m_max: usize,
     dim: usize,
     visited_set: TLSet,
-    pub stats: Statistic
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -101,8 +81,8 @@ impl From<u64> for Neighbour {
     }
 }
 
-enum DistMode<'a> {
-    QKDist(&'a [f32]),
+enum DistMode {
+    QKDist,
     KKDist
 }
 
@@ -120,29 +100,25 @@ fn prefetch_slice<T, const LOCALITY: i32, const LINES: i32>(slice: &[T]) {
     }
 }
 
-impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
+impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square + Mean> Index<T> {
+    // NOTE: distance should be positive (will be compared using bits)
     #[inline(always)]
-    fn distance(&self, a: ArrayView2<T>, b: &[T], mode: &DistMode) -> f32 {
+    fn distance(&self, a: &[T], b: &[T], mode: &DistMode) -> f32 {
         let r_sq = self.options.r_sq;
 
         // After raising dim, q'=(q; 0), k'=(k; sqrt(r^2 - |k|^2)). 
         return match mode {
-            DistMode::QKDist(q_l2sq) => {
-                // |q'-k'|^2 = |q|^2 + |k|^2 + (r^2 - |k|^2) - 2q.k = |q|^2 + r^2 - 2q.k
-                f32::from_bits((0..a.shape()[0]).map(|i| {
-                    let a = a.row(i);
-                    let a = a.as_slice().unwrap();
-                    (q_l2sq[i] + r_sq - 2.0 * T::dot(a, b)).to_bits()   // we can use bits for comparison since |q'-k'|^2 >= 0
-                }).min().unwrap())
+            DistMode::QKDist => {
+                // mean(|q'-k'|^2) = mean(|q|^2 + |k|^2 + (r^2 - |k|^2) - 2q.k) = mean(|q|^2 + r^2) - 2q.k = constant - 2q.k
+                // FIXME: we assume that 65536.0 - T::dot(a, b) >= 0
+                65536.0 - T::dot(a, b)
             },
 
             DistMode::KKDist => {
                 // |k1'-k2'|^2 = |k1 - k2|^2 + (sqrt(r^2 - |k1|^2) - sqrt(r^2 - |k2|^2))^2
-                assert!(a.shape()[0] == 1, "Group size greater than 1 not supported for KK distance");
-                let a = a.row(0);
-                let a = a.as_slice().unwrap();
+                //             = 2r^2 - 2k1.k2 - 2sqrt(r^2 - |k1|^2)sqrt(r^2 - |k2|^2)
                 let (s1, s2) = (sqrtf32(r_sq - T::dot(a, a)), sqrtf32(r_sq - T::dot(b, b)));
-                T::l2sq(a, b) + (s1 - s2) * (s1 - s2)
+                r_sq - T::dot(a, b) - s1 * s2
             }
         }
     }
@@ -169,6 +145,27 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
     }
 
     #[inline(always)]
+    fn get_print_key(&self, id: NodeID) -> Vec<f32> {
+        let start = self.get_offset(id);
+        let mut key: Vec<f32> = self.keys[start..start + self.dim].iter().map(|v| v.to_f32()).collect();
+        key.push(sqrtf32(self.options.r_sq - T::dot(&self.keys[start..start + self.dim], &self.keys[start..start + self.dim])));
+        key
+    }
+
+    #[inline(always)]
+    fn get_print_query(&self, q: ArrayView2<T>) -> Vec<Vec<f32>> {
+        let mut res: Vec<Vec<f32>> = vec![];
+        for i in 0..q.shape()[0] {
+            let row = q.row(i);
+            let row = row.as_slice().unwrap();
+            let mut key: Vec<f32> = row.iter().map(|v| v.to_f32()).collect();
+            key.push(0.0f32);
+            res.push(key);
+        }
+        res
+    }
+
+    #[inline(always)]
     fn get_val(&self, id: NodeID) -> &[T] {
         let start = self.get_offset(id);
         &self.vals[start..start + self.dim]
@@ -177,7 +174,7 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
     /// Searches for `ef` nearest neighbors of a query vector `q` in the layer from entry points `ep`.
     /// Note that the returned neighbors are sorted by distance (from min to max)
     #[inline(always)]
-    fn search_nn(&self, q: ArrayView2<T>, ep: &[Neighbour], ef: usize, dist_mode: &DistMode) -> Vec<Neighbour> {
+    fn search_nn(&self, q: &[T], ep: &[Neighbour], ef: usize, dist_mode: DistMode) -> Vec<Neighbour> {
         let mut candidates: BinaryHeap<Reverse<u64>> = ep.iter().map(|n| Reverse(n.clone().into())).collect(); // candidate nearest neighbors (min-heap)
         let mut nns       : BinaryHeap<u64>          = ep.iter().map(|n| n.clone().into()).collect();          // result nearest neighbors    (max-heap)
 
@@ -204,11 +201,10 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
 
             // pop the nearest candidate
             candidates.pop();
-            self.stats.num_expanded_nodes.fetch_add(1, Ordering::Relaxed);
+            counter!(format!("{}_num_expanded_nodes", self.options.name)).increment(1);
 
             // gather unvisited neighbors of the candidate
             let edges = &candidate.edges[..candidate.edges_len as usize];
-            self.stats.num_candidates_raw.fetch_add(edges.len(), Ordering::Relaxed);
             let mut staging = vec![(0u32, 0.0f32); edges.len()];
             let mut staging_len = 0;
             for i in 0..edges.len() {
@@ -225,9 +221,9 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
                 }
             }
             staging.truncate(staging_len);
-            self.stats.num_candidates_unvisited.fetch_add(staging.len(), Ordering::Relaxed);
 
             // distance calculation
+            counter!(format!("{}_num_accessed_nodes", self.options.name)).increment(staging.len() as u64);
             for i in 0..staging.len() {
                 staging[i].1 = self.distance(q, self.get_key(staging[i].0), &dist_mode);
             }
@@ -239,7 +235,6 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
 
                 if dist >= furthest && nns.len() >= ef {
                     // skip if the distance is greater than the furthest in the result set
-                    self.stats.num_candidates_pruned.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
 
@@ -279,9 +274,7 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
             let candidate: Neighbour = candidates.pop().unwrap().0.into();
 
             for sel in selected.iter() {
-                let a = self.get_key(sel.node);
-                let a = ArrayView2::from_shape((1, a.len()), a).unwrap();
-                let dist = self.distance(a, self.get_key(candidate.node), &DistMode::KKDist);
+                let dist = self.distance(self.get_key(sel.node), self.get_key(candidate.node), &DistMode::KKDist);
                 if dist < candidate.dist {
                     // if we select the candidate, the distance between candidate and selected node is too small
                     // skip this candidate
@@ -310,8 +303,7 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
         // shrink if necessary
         if edges.len() > m_max {
             let candidates = edges.iter().map(|&dst_id| {
-                let a = ArrayView2::from_shape((1, node_vec.len()), node_vec).unwrap();
-                Neighbour { dist: self.distance(a, self.get_key(dst_id), &DistMode::KKDist), node: dst_id }
+                Neighbour { dist: self.distance(node_vec, self.get_key(dst_id), &DistMode::KKDist), node: dst_id }
             }).collect::<Vec<_>>();
             edges = self.select_neighbors(&candidates, m_max).iter().map(|n| n.node).collect();
         }
@@ -320,10 +312,6 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
         node.edges = [NodeID::MAX; MAX_NUM_NEIGHBOURS];
         node.edges[..edges.len()].copy_from_slice(&edges);
         node.edges_len = edges.len() as u8;
-    }
-
-    pub fn clear_stats(&mut self) {
-        self.stats = Statistic::new();
     }
 
     pub fn prefill(&mut self, keys: ArrayView2<T>, vals: ArrayView2<T>, neighbours: ArrayView2<NodeID>) -> Result<(), ()> {
@@ -372,8 +360,7 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
         // search nearest neighbours
         if !ep.is_empty() {
             // expand and select neighbours
-            let key = ArrayView2::from_shape((1, self.dim), key).unwrap();
-            let ep = self.search_nn(key, ep, self.options.ef_cons, &DistMode::KKDist);
+            let ep = self.search_nn(key, ep, self.options.ef_cons, DistMode::KKDist);
             let neighbours = self.select_neighbors(&ep, self.options.m).iter().map(|n| n.node).collect::<Vec<_>>();
 
             // create node and node -> neighbor connection
@@ -403,26 +390,75 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
         Ok(())
     }
 
+    pub fn search_bruteforce(&self, query: ArrayView2<T>, ef: usize) -> (Array2<T>, Array2<T>) {
+        assert_eq!(query.shape()[1], self.dim, "Query dimension does not match index dimension");
+
+        counter!(format!("{}_num_searches", self.options.name)).increment(1);
+
+        let start = Instant::now();
+
+        // brute-force search
+        let mut heap: BinaryHeap<u64> = BinaryHeap::with_capacity(ef); // max-heap
+        for node_id in 0..self.options.n_max as NodeID {
+            let node = self.get_node(node_id);
+            if !node.valid {
+                break;
+            }
+            let key = self.get_key(node_id);
+            let dist = 65536.0 - (0..query.shape()[0]).map(|i| {
+                let a = query.row(i);
+                let a = a.as_slice().unwrap();
+                T::dot(a, key)   // we can use bits for comparison since |q'-k'|^2 >= 0
+            }).sum::<f32>() / (query.shape()[0] as f32);
+            assert!(dist > 0.0);
+
+            let neigh = Neighbour { dist, node: node_id };
+            if heap.len() < ef {
+                heap.push(neigh.clone().into());
+            } else if dist < Neighbour::from(*heap.peek().unwrap()).dist {
+                *heap.peek_mut().unwrap() = neigh.clone().into();
+            }
+        }
+
+        let search_time = start.elapsed().as_micros() as usize;
+        counter!(format!("{}_search_latency", self.options.name)).increment(search_time as u64);
+
+        // collect
+        let neighbors = heap.into_sorted_vec().into_iter().map(|n| Neighbour::from(n)).collect::<Vec<_>>();
+        assert!(neighbors.len() <= ef, "Number of neighbors returned exceeds ef");
+        let mut keys = Array2::<T>::from_elem((ef, self.dim), T::zero());
+        let mut vals = Array2::<T>::from_elem((ef, self.dim), T::zero());
+        for i in 0..neighbors.len() {
+            let neighbor = &neighbors[i];
+            let key_slice = self.get_key(neighbor.node);
+            let val_slice = self.get_val(neighbor.node);
+            keys.slice_mut(s![i, ..key_slice.len()]).assign(&ArrayView1::from(key_slice));
+            vals.slice_mut(s![i, ..val_slice.len()]).assign(&ArrayView1::from(val_slice));
+        }
+
+        (keys, vals)
+    }
+
     // return (ef, dim) of (K, V)
     pub fn search(&self, query: ArrayView2<T>, ef: usize, ep: ArrayView1<Neighbour>) -> (Array2<T>, Array2<T>) {
         assert_eq!(query.shape()[1], self.dim, "Query dimension does not match index dimension");
         let ep = ep.as_slice().unwrap();
 
-        self.stats.num_searches.fetch_add(1, Ordering::Relaxed);
+        //println!("ep[0] dist={} key={:?} query={:?}", ep[0].dist, self.get_print_key(ep[0].node), self.get_print_query(query));
+
+        counter!(format!("{}_num_searches", self.options.name)).increment(1);
 
         let start = Instant::now();
 
-        // calculate q_l2sq
-        let q_l2sq = query.rows().into_iter().map(|row| {
-            let row = row.as_slice().unwrap();
-            T::dot(row, row)
-        }).collect::<Vec<_>>();
+        // calculate q_mean
+        let mut q_mean = vec![T::zero(); self.dim];
+        T::mean(query.as_slice().unwrap(), &mut q_mean);
 
         // search at level 0
-        let neighbors = self.search_nn(query, &ep, ef, &DistMode::QKDist(&q_l2sq));
+        let neighbors = self.search_nn(&q_mean, &ep, ef, DistMode::QKDist);
 
         let search_time = start.elapsed().as_micros() as usize;
-        self.stats.search_latency.fetch_add(search_time, Ordering::Relaxed);
+        counter!(format!("{}_search_latency", self.options.name)).increment(search_time as u64);
 
         // collect
         assert!(neighbors.len() <= ef, "Number of neighbors returned exceeds ef");
@@ -453,7 +489,6 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
             m_max,
             dim,
             visited_set: TLSet::new(options.n_max * BATCH_SIZE),
-            stats: Statistic::new(),
             options,
         }
     }
@@ -492,7 +527,7 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
         let options = snapshot.options;
         let dim = snapshot.dim;
 
-        let nodes: Vec<Node<T>> = snapshot.nodes.into_iter().map(|node| {
+        let mut nodes: Vec<Node<T>> = snapshot.nodes.into_iter().map(|node| {
             let mut edges = [NodeID::MAX; MAX_NUM_NEIGHBOURS];
             edges[..node.edges.len()].copy_from_slice(&node.edges);
             Node {
@@ -502,13 +537,19 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
                 phantom: PhantomData,
             }
         }).collect();
+        nodes.resize_with(options.n_max, || Node {
+            valid: false,
+            edges: [NodeID::MAX; MAX_NUM_NEIGHBOURS],
+            edges_len: 0,
+            phantom: PhantomData,
+        });
 
         let src = snapshot.keys.into_iter().map(|v| T::from_f32(v)).collect::<Vec<_>>();
-        let mut keys: Vec<T> = repeat_with(|| T::zero()).take(nodes.len() * dim).collect();
+        let mut keys: Vec<T> = repeat_with(|| T::zero()).take(options.n_max * dim).collect();
         keys[..src.len()].copy_from_slice(&src);
 
         let src = snapshot.vals.into_iter().map(|v| T::from_f32(v)).collect::<Vec<_>>();
-        let mut vals: Vec<T> = repeat_with(|| T::zero()).take(nodes.len() * dim).collect();
+        let mut vals: Vec<T> = repeat_with(|| T::zero()).take(options.n_max * dim).collect();
         vals[..src.len()].copy_from_slice(&src);
 
         let m_max = options.m * 2;
@@ -521,7 +562,6 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
             m_max,
             dim,
             visited_set: TLSet::new(options.n_max * BATCH_SIZE),
-            stats: Statistic::new(),
             options,
         }
     }
