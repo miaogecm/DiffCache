@@ -11,6 +11,7 @@ from cuvs.neighbors import cagra
 import numpy as np
 import torch.utils.dlpack as dlpack
 import os
+import json
 
 
 MAX_QUERY_HISTORY = 32
@@ -34,7 +35,7 @@ class DiffCache:
         nsw_ef_cons: int,
         prefix_kvcache_len: int,
         suffix_kvcache_len: int,
-        r_sq: List[float],
+        r_sq: List[List[float]],
         batch_prefill: bool
     ) -> None:
         self.num_layers = num_layers
@@ -153,6 +154,13 @@ class DiffCache:
         layer_idx
     ):
         seq_len = key_states.size(1)
+
+        # estimate r_sq based on prefill result
+        r_sq = torch.einsum("bshd,bshd->bsh", key_states, key_states).max(dim=1).values.max(dim=0).values.tolist()
+        self.r_sq[layer_idx] = r_sq
+        for mb in range(self.num_mbs):
+            self.index_layers[mb][layer_idx].set_r_sq(r_sq)
+            self.data_layers[mb][layer_idx].update_r_sq(r_sq)
 
         # save prefix region to GPU
         prefix_len = min(self.prefix_kvcache_len, seq_len)
@@ -402,6 +410,13 @@ class DiffCache:
     def save_prefill_cache(self, prefill_cache_path):
         print("Saving prefill cache...")
 
+        path = os.path.join(prefill_cache_path, "metadata.txt")
+        metadata = {
+            "r_sq": self.r_sq,
+        }
+        with open(path, 'w') as f:
+            json.dump(metadata, f)
+
         # save prefix cache
         for layer_idx in range(self.num_layers):
             layer_path = os.path.join(prefill_cache_path, f"p_l_{layer_idx:03d}")
@@ -446,6 +461,15 @@ class DiffCache:
 
         ctx_len = inputs_ids.size(1)
 
+        path = os.path.join(prefill_cache_path, "metadata.txt")
+        with open(path, 'r') as f:
+            metadata = json.load(f)
+        self.r_sq = metadata["r_sq"]
+        for mb in range(self.num_mbs):
+            for layer_idx in range(self.num_layers):
+                self.index_layers[mb][layer_idx].set_r_sq(self.r_sq[layer_idx])
+                self.data_layers[mb][layer_idx].update_r_sq(self.r_sq[layer_idx])
+            
         for layer_idx in range(self.num_layers):
             prefix_layer_path = os.path.join(prefill_cache_path, f"p_l_{layer_idx:03d}")
             suffix_layer_path = os.path.join(prefill_cache_path, f"s_l_{layer_idx:03d}")

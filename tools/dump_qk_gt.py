@@ -24,13 +24,13 @@ def parse_args():
     parser.add_argument(
         "--input_ids",
         type=str,
-        default="input_ids.pt",
+        default="../.data/input_ids.pt",
         help="Path to torch.save'd LongTensor with token ids",
     )
     parser.add_argument(
         "--out_dir",
         type=str,
-        default="/root/autodl-tmp/qkvdump",
+        default="/home/ubuntu/projects/DiffCache/.data/qkvdump",
         help="Output directory for dumped Q/K tensors",
     )
     parser.add_argument(

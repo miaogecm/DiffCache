@@ -1,11 +1,11 @@
---extra-index-url https://download.pytorch.org/whl/cu128
+--extra-index-url https://download.pytorch.org/whl/cu124
 
 tqdm
 ninja
 argparse
 termcolor
 packaging
-torch==2.8.0+cu128
+torch==2.6.0+cu124
 transformers
 pybind11
 setuptools

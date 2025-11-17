@@ -31,7 +31,7 @@ class BaseModel:
             os.makedirs(self.prefill_cache_dir, exist_ok=True)
         else:
             self.prefill_cache_dir = None
-        self.query_save_dir = "/home/sjr/projects/diffcache/.data"
+        self.query_save_dir = None
 
         # TODO: only bf16 is supported for now
         assert(dtype == torch.bfloat16), "Only torch.bfloat16 is supported for now."
@@ -39,7 +39,6 @@ class BaseModel:
 
     def layer_prefill(self, layer_idx, hidden_states):
         # print(f'Layer = {layer_idx}')
-
         bsz, seq_len, dim = hidden_states.shape
         layer = self.layers[layer_idx]
         
@@ -177,9 +176,9 @@ class BaseModel:
             prefill_cache_path = self.create_prefill_cache_path(inputs_ids)
             result = self.do_prefill_forward(inputs_ids, prefill_cache_path)
             # save keys
-            dir = os.path.join(prefill_cache_path, "qk")
-            os.makedirs(dir, exist_ok=True)
-            self.kv_cache.save_keys(dir)
+            # dir = os.path.join(prefill_cache_path, "qk")
+            # os.makedirs(dir, exist_ok=True)
+            # self.kv_cache.save_keys(dir)
             # save inputs_ids after everything is done
             torch.save(inputs_ids, os.path.join(prefill_cache_path, "input_ids.pt"))
             return result

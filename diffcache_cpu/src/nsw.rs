@@ -117,7 +117,7 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square + Mean> Index<T> {
             DistMode::KKDist => {
                 // |k1'-k2'|^2 = |k1 - k2|^2 + (sqrt(r^2 - |k1|^2) - sqrt(r^2 - |k2|^2))^2
                 //             = 2r^2 - 2k1.k2 - 2sqrt(r^2 - |k1|^2)sqrt(r^2 - |k2|^2)
-                let (s1, s2) = (sqrtf32(r_sq - T::dot(a, a)), sqrtf32(r_sq - T::dot(b, b)));
+                let (s1, s2) = (sqrtf32(f32::max(r_sq - T::dot(a, a), 0.0)), sqrtf32(f32::max(r_sq - T::dot(b, b), 0.0)));
                 r_sq - T::dot(a, b) - s1 * s2
             }
         }
@@ -491,6 +491,10 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square + Mean> Index<T> {
             visited_set: TLSet::new(options.n_max * BATCH_SIZE),
             options,
         }
+    }
+
+    pub fn update_r_sq(&mut self, r_sq: f32) {
+        self.options.r_sq = r_sq;
     }
 
     fn take_snapshot(&self) -> IndexSnapshot {

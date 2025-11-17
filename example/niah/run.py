@@ -37,21 +37,29 @@ def main():
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--book_path", type=str, default="../.data/war-and-peace-128k.txt")
     parser.add_argument("--needle_ratio", type=float, default=0.5, help="Insertion ratio in [0,1].")
-    parser.add_argument("--needle_text", type=str, default="[[[NEEDLE: The secret verification code is JUPITER-19.]]]")
-    parser.add_argument("--question_prefix", type=str, default="Return only the hidden verification code. Here is the book:\n")
     parser.add_argument("--max_gen_len", type=int, default=32)
     args = parser.parse_args()
 
     # Load and inject needle
     with open(args.book_path, "r", encoding="utf-8") as f:
         book_text = f.read()
-    book_with_needle = insert_needle(book_text, args.needle_text, args.needle_ratio)
+    needle_text = "\n\nNEEDLE: The secret verification code is JUPITER-19.\n\n"
+    book_with_needle = insert_needle(book_text, needle_text, args.needle_ratio)
+
+    question_text = (
+        "\n\nIn the document above there is a line that starts with \"NEEDLE:\".\n"
+        "Find that line and output it exactly.\n\nAnswer:"
+    )
 
     # Tokenize
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
     messages = [
-        { "role": "system", "content": "You are a helpful assistant." },
-        { "role": "user", "content": args.question_prefix + book_with_needle }
+        {
+            "role": "system",
+            "content": "You are a careful assistant. When asked, you MUST copy exactly "
+                       "the line that starts with 'NEEDLE:' from the given document.",
+        },
+        { "role": "user", "content": book_with_needle + question_text }
     ]
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True)

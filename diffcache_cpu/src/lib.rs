@@ -49,7 +49,7 @@ thread_local! {
 static NEXT_CORE: AtomicUsize = AtomicUsize::new(0);
 
 static THREAD_POOL: LazyLock<ThreadPool> = LazyLock::new(|| Builder::new()
-                                                            .num_threads(4)
+                                                            .num_threads(8)
                                                             .build());
 
 fn try_bind_core() {
@@ -517,7 +517,7 @@ impl DiffCacheCPU {
             r_sq: [4.0].repeat(kv_head_num),
             batch_search: false,
             name: "l0".into(),
-            use_bruteforce: true
+            use_bruteforce: false
         };
         if let Some(dict) = kwargs {
             for (key, value) in dict.iter() {
@@ -612,6 +612,20 @@ impl DiffCacheCPU {
     fn get_keys<'py>(&self, py: Python<'py>) -> Py<PyArray4<f32>> {
         let keys = self.data_layer.get_keys().mapv(|x| x.to_f32());
         keys.into_pyarray(py).into()
+    }
+
+    fn update_r_sq(&mut self, r_sq: Vec<f32>) {
+        assert!(r_sq.len() == self.data_layer.kv_head_num, "r_sq length must match kv_head_num");
+        for b in 0..self.data_layer.bsz {
+            for kh in 0..self.data_layer.kv_head_num {
+                let index = self.data_layer.indexes[b][kh].clone();
+                let r_sq = r_sq[kh];
+                THREAD_POOL.execute(move || {
+                    let mut index = index.write().unwrap();
+                    index.update_r_sq(r_sq);
+                });
+            }
+        }
     }
 }
 

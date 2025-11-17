@@ -123,3 +123,7 @@ class IndexLayer:
         self.k[:, :count, :, :] = k
         self.node_ids[:, :count] = node_ids
         self.num_seeds = count
+
+    def set_r_sq(self, r_sq: List[float]):
+        assert len(r_sq) == self.num_kv_heads, "r_sq length must match num_kv_heads"
+        self.r_sq = torch.tensor(r_sq, device='cuda', dtype=torch.float32)  # (num_kv_heads,)
