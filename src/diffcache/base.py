@@ -4,7 +4,6 @@ from termcolor import colored
 from tqdm import tqdm
 from codetiming import Timer
 import os
-from .kvcache.diffcache import MAX_QUERY_HISTORY
 
 
 class BaseModel:
@@ -175,10 +174,6 @@ class BaseModel:
         if prefill_cache_path is None:
             prefill_cache_path = self.create_prefill_cache_path(inputs_ids)
             result = self.do_prefill_forward(inputs_ids, prefill_cache_path)
-            # save keys
-            # dir = os.path.join(prefill_cache_path, "qk")
-            # os.makedirs(dir, exist_ok=True)
-            # self.kv_cache.save_keys(dir)
             # save inputs_ids after everything is done
             torch.save(inputs_ids, os.path.join(prefill_cache_path, "input_ids.pt"))
             return result

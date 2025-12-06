@@ -1,10 +1,10 @@
-use crate::{Distance, HugeArray, L2Square, Mean, Neighbour, NodeID};
+use crate::{Distance, HugeArray, L2Square, Neighbour, NodeID};
 use std::{array, cmp::{Reverse, max, min}, collections::{BinaryHeap, HashSet}, f32, intrinsics::{prefetch_read_data, sqrtf32}, io::{BufReader, BufWriter}, iter::repeat_with, marker::PhantomData, ops::{Add, Div}, path::Path, sync::atomic::Ordering, time::Instant};
 use crate::{Value};
 use std::cell::RefCell;
 use super::tlset::TLSet;
 use metrics::counter;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
 use serde::{Deserialize, Serialize};
 use simsimd::SpatialSimilarity;
 use std::sync::atomic::AtomicUsize;
@@ -20,7 +20,7 @@ pub struct Options {
     pub ef_cons: usize,
     pub n_max: usize,      // maximum number of nodes
     pub r_sq: f32,
-    pub name: String
+    pub name: String,
 }
 
 #[derive(Clone, Debug)]
@@ -45,6 +45,7 @@ pub struct Index<T: Clone> {
     m_max: usize,
     dim: usize,
     visited_set: TLSet,
+    num_nodes: usize
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -60,6 +61,7 @@ struct IndexSnapshot {
     vals: Vec<f32>,
     options: Options,
     dim: usize,
+    num_nodes: usize,
 }
 
 impl From<Neighbour> for u64 {
@@ -100,7 +102,7 @@ fn prefetch_slice<T, const LOCALITY: i32, const LINES: i32>(slice: &[T]) {
     }
 }
 
-impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square + Mean> Index<T> {
+impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
     // NOTE: distance should be positive (will be compared using bits)
     #[inline(always)]
     fn distance(&self, a: &[T], b: &[T], mode: &DistMode) -> f32 {
@@ -346,11 +348,30 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square + Mean> Index<T> {
         Ok(())
     }
 
-    pub fn insert(&mut self, node_id: NodeID, key: ArrayView1<T>, val: ArrayView1<T>, ep: ArrayView1<Neighbour>) -> Result<(), ()> {
+    fn get_ep<'a>(&self, key: &[T], ep: &[Neighbour], dist_mode: &DistMode) -> Option<Vec<Neighbour>> {
+        if !ep.is_empty() {
+            Some(ep.to_vec())
+        } else if self.num_nodes == 0 {
+            // empty index
+            None
+        } else {
+            // ramdom entry point
+            let node_id = (self.num_nodes as f32 * rand::random::<f32>()) as NodeID;
+            assert!(node_id < self.num_nodes as NodeID, "Random entry point node ID out of range");
+            let dist = self.distance(key, self.get_key(node_id), dist_mode);
+            Some(vec![Neighbour { dist, node: node_id }])
+        }
+    }
+
+    pub fn insert(&mut self, key: ArrayView1<T>, val: ArrayView1<T>, ep: ArrayView1<Neighbour>) -> Result<(), ()> {
         assert_eq!(key.shape(), [self.dim], "Vector dimension does not match index dimension");
         let key = key.as_slice().unwrap();
         let val = val.as_slice().unwrap();
-        let ep = ep.as_slice().unwrap();
+        let ep = self.get_ep(key, ep.as_slice().unwrap(), &DistMode::KKDist);
+
+        // get node ID
+        let node_id = self.num_nodes as NodeID;
+        self.num_nodes += 1;
 
         // write vector
         let vec_start = self.get_offset(node_id);
@@ -358,9 +379,9 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square + Mean> Index<T> {
         self.vals[vec_start..vec_start + self.dim].copy_from_slice(&val);
 
         // search nearest neighbours
-        if !ep.is_empty() {
+        if let Some(ep) = ep {
             // expand and select neighbours
-            let ep = self.search_nn(key, ep, self.options.ef_cons, DistMode::KKDist);
+            let ep = self.search_nn(key, &ep, self.options.ef_cons, DistMode::KKDist);
             let neighbours = self.select_neighbors(&ep, self.options.m).iter().map(|n| n.node).collect::<Vec<_>>();
 
             // create node and node -> neighbor connection
@@ -390,8 +411,8 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square + Mean> Index<T> {
         Ok(())
     }
 
-    pub fn search_bruteforce(&self, query: ArrayView2<T>, ef: usize) -> (Array2<T>, Array2<T>) {
-        assert_eq!(query.shape()[1], self.dim, "Query dimension does not match index dimension");
+    pub fn search_bruteforce(&self, query: ArrayView1<T>, ef: usize, mut out_keys: ArrayViewMut2<T>, mut out_vals: ArrayViewMut2<T>) {
+        assert_eq!(query.shape()[0], self.dim, "Query dimension does not match index dimension");
 
         counter!(format!("{}_num_searches", self.options.name)).increment(1);
 
@@ -405,12 +426,7 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square + Mean> Index<T> {
                 break;
             }
             let key = self.get_key(node_id);
-            let dist = 65536.0 - (0..query.shape()[0]).map(|i| {
-                let a = query.row(i);
-                let a = a.as_slice().unwrap();
-                T::dot(a, key)   // we can use bits for comparison since |q'-k'|^2 >= 0
-            }).sum::<f32>() / (query.shape()[0] as f32);
-            assert!(dist > 0.0);
+            let dist = self.distance(query.as_slice().unwrap(), key, &DistMode::QKDist);
 
             let neigh = Neighbour { dist, node: node_id };
             if heap.len() < ef {
@@ -426,52 +442,40 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square + Mean> Index<T> {
         // collect
         let neighbors = heap.into_sorted_vec().into_iter().map(|n| Neighbour::from(n)).collect::<Vec<_>>();
         assert!(neighbors.len() <= ef, "Number of neighbors returned exceeds ef");
-        let mut keys = Array2::<T>::from_elem((ef, self.dim), T::zero());
-        let mut vals = Array2::<T>::from_elem((ef, self.dim), T::zero());
         for i in 0..neighbors.len() {
             let neighbor = &neighbors[i];
             let key_slice = self.get_key(neighbor.node);
             let val_slice = self.get_val(neighbor.node);
-            keys.slice_mut(s![i, ..key_slice.len()]).assign(&ArrayView1::from(key_slice));
-            vals.slice_mut(s![i, ..val_slice.len()]).assign(&ArrayView1::from(val_slice));
+            out_keys.slice_mut(s![i, ..key_slice.len()]).assign(&ArrayView1::from(key_slice));
+            out_vals.slice_mut(s![i, ..val_slice.len()]).assign(&ArrayView1::from(val_slice));
         }
-
-        (keys, vals)
     }
 
     // return (ef, dim) of (K, V)
-    pub fn search(&self, query: ArrayView2<T>, ef: usize, ep: ArrayView1<Neighbour>) -> (Array2<T>, Array2<T>) {
-        assert_eq!(query.shape()[1], self.dim, "Query dimension does not match index dimension");
-        let ep = ep.as_slice().unwrap();
-
-        //println!("ep[0] dist={} key={:?} query={:?}", ep[0].dist, self.get_print_key(ep[0].node), self.get_print_query(query));
+    pub fn search(&self, query: ArrayView1<T>, ef: usize, ep: ArrayView1<Neighbour>, mut out_keys: ArrayViewMut2<T>, mut out_vals: ArrayViewMut2<T>) {
+        assert_eq!(query.shape()[0], self.dim, "Query dimension does not match index dimension");
+        let query = query.as_slice().unwrap();
+        let ep = self.get_ep(query, ep.as_slice().unwrap(), &DistMode::QKDist).unwrap();
 
         counter!(format!("{}_num_searches", self.options.name)).increment(1);
 
         let start = Instant::now();
 
-        // calculate q_mean
-        let mut q_mean = vec![T::zero(); self.dim];
-        T::mean(query.as_slice().unwrap(), &mut q_mean);
-
         // search at level 0
-        let neighbors = self.search_nn(&q_mean, &ep, ef, DistMode::QKDist);
+        let neighbors = self.search_nn(query, &ep, ef, DistMode::QKDist);
 
         let search_time = start.elapsed().as_micros() as usize;
         counter!(format!("{}_search_latency", self.options.name)).increment(search_time as u64);
 
         // collect
         assert!(neighbors.len() <= ef, "Number of neighbors returned exceeds ef");
-        let mut keys = Array2::<T>::from_elem((ef, self.dim), T::zero());
-        let mut vals = Array2::<T>::from_elem((ef, self.dim), T::zero());
         for i in 0..neighbors.len() {
             let neighbor = &neighbors[i];
             let key_slice = self.get_key(neighbor.node);
             let val_slice = self.get_val(neighbor.node);
-            keys.slice_mut(s![i, ..key_slice.len()]).assign(&ArrayView1::from(key_slice));
-            vals.slice_mut(s![i, ..val_slice.len()]).assign(&ArrayView1::from(val_slice));
+            out_keys.slice_mut(s![i, ..key_slice.len()]).assign(&ArrayView1::from(key_slice));
+            out_vals.slice_mut(s![i, ..val_slice.len()]).assign(&ArrayView1::from(val_slice));
         }
-        (keys, vals)
     }
 
     pub fn new(dim: usize, options: Options) -> Self {
@@ -490,6 +494,7 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square + Mean> Index<T> {
             dim,
             visited_set: TLSet::new(options.n_max * BATCH_SIZE),
             options,
+            num_nodes: 0,
         }
     }
 
@@ -524,6 +529,7 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square + Mean> Index<T> {
             vals,
             options: self.options.clone(),
             dim: self.dim,
+            num_nodes: self.num_nodes,
         }
     }
 
@@ -567,6 +573,7 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square + Mean> Index<T> {
             dim,
             visited_set: TLSet::new(options.n_max * BATCH_SIZE),
             options,
+            num_nodes: snapshot.num_nodes,
         }
     }
 

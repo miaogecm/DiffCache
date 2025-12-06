@@ -128,17 +128,13 @@ class LlamaModel(BaseModel):
             num_kv_heads = self.num_key_value_heads,
             num_q_heads = self.num_heads,
             head_dim = self.head_dim,
-            index_layer_prob = config["index_layer_prob"],
-            max_index_layer_sz = config["max_index_layer_sz"],
             nsw_m = config["nsw_m"],
             nsw_ef_cons = config["nsw_ef_cons"],
             r_sq = r_sq,
-            minibatch_size = config["minibatch_size"],
-            num_seeds = config["num_seeds"],
             retrieval_budget = config["retrieval_budget"],
-            batch_prefill = config["batch_prefill"],
-            prefix_kvcache_len = config["prefix_kvcache_len"],
-            suffix_kvcache_len = config["suffix_kvcache_len"]
+            kvbuf_prefix_len = config["kvbuf_prefix_len"],
+            kvbuf_suffix_len = config["kvbuf_suffix_len"],
+            kvbuf_suffix_maxlen = config["kvbuf_suffix_maxlen"],
         )
         print(f"KVCache init")
 
