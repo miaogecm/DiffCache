@@ -48,22 +48,24 @@ class DiffCache:
         #    ┌────────────────────┬────────────┬───────────────┐    
         # ◄──┼  retrieval_budget  │ prefix_len │ suffix_maxlen ┼───►
         #    └────────────────────┴────────────┴───────────────┘    
+        # Note that the permutation is (bsz, kh, seq_len, hd), not (bsz, seq_len, kh, hd)
         self.kvbuf_suffix_maxlen = kvbuf_suffix_maxlen
         self.kvbuf_prefix_len = kvbuf_prefix_len
         self.kvbuf_suffix_len = kvbuf_suffix_len
         kvbuf_len = retrieval_budget + kvbuf_prefix_len + kvbuf_suffix_maxlen
         self.kbuf = [torch.empty(
-            (batch_size, kvbuf_len, num_kv_heads, head_dim),
+            (batch_size, num_kv_heads, kvbuf_len, head_dim),
             device='cuda',
             dtype=torch.bfloat16,
         ) for _ in range(num_layers)]
         self.vbuf = [torch.empty(
-            (batch_size, kvbuf_len, num_kv_heads, head_dim),
+            (batch_size, num_kv_heads, kvbuf_len, head_dim),
             device='cuda',
             dtype=torch.bfloat16,
         ) for _ in range(num_layers)]
 
         # CPU kv buffer
+        # Note that the permutation is (bsz, kh, seq_len, hd), not (bsz, seq_len, kh, hd)
         self.kbuf_cpu = [torch.zeros(
             (batch_size, num_kv_heads, self.retrieval_budget, head_dim),
             device='cpu',
@@ -119,7 +121,11 @@ class DiffCache:
                 k = torch.cat([k, extra], dim=1)  # (seq_len, head_dim + 1)
 
                 # build index and extract graph
-                build_params = cagra.IndexParams(metric="sqeuclidean", graph_degree=deg)
+                build_params = cagra.IndexParams(
+                    metric="sqeuclidean", 
+                    graph_degree=deg,
+                    intermediate_graph_degree=4 * deg,
+                )
                 index = cagra.build(build_params, k)
                 neighbours[b, h, :, :] = index.graph.copy_to_host()
 
@@ -127,9 +133,9 @@ class DiffCache:
 
         # CPU prefill
         data_layer = self.data_layers[layer_idx]
-        k_cpu = keys.contiguous().view(dtype=torch.uint16).cpu().numpy()        # (batch_size, seq_len, num_kv_heads, head_dim)
-        v_cpu = values.contiguous().view(dtype=torch.uint16).cpu().numpy()      # (batch_size, seq_len, num_kv_heads, head_dim)
-        neighbours_cpu = neighbours[:, :, :, :]                                 # (batch_size, num_kv_heads, seq_len, deg)
+        k_cpu = keys.permute(0, 2, 1, 3).contiguous().view(dtype=torch.uint16).cpu().numpy()        # (batch_size, num_kv_heads, seq_len, head_dim)
+        v_cpu = values.permute(0, 2, 1, 3).contiguous().view(dtype=torch.uint16).cpu().numpy()      # (batch_size, num_kv_heads, seq_len, head_dim)
+        neighbours_cpu = neighbours[:, :, :, :]                                     # (batch_size, num_kv_heads, seq_len, deg)
         data_layer.prefill(k_cpu, v_cpu, neighbours_cpu)
 
     def prefill_update_kv_cache(
@@ -147,14 +153,14 @@ class DiffCache:
 
         # (1) save prefix region to GPU
         prefix_len = min(self.kvbuf_prefix_len, seq_len)
-        self.kbuf[layer_idx][:, self.retrieval_budget:self.retrieval_budget + prefix_len, :, :].copy_(key_states[:, :prefix_len, :, :])
-        self.vbuf[layer_idx][:, self.retrieval_budget:self.retrieval_budget + prefix_len, :, :].copy_(value_states[:, :prefix_len, :, :])
+        self.kbuf[layer_idx][:, :, self.retrieval_budget:self.retrieval_budget + prefix_len, :].copy_(key_states[:, :prefix_len, :, :].permute(0, 2, 1, 3))
+        self.vbuf[layer_idx][:, :, self.retrieval_budget:self.retrieval_budget + prefix_len, :].copy_(value_states[:, :prefix_len, :, :].permute(0, 2, 1, 3))
         self.kvbuf_prefix_len = prefix_len
 
         # (2) save suffix region to GPU
         suffix_len = min(self.kvbuf_suffix_len, seq_len - prefix_len)
-        self.kbuf[layer_idx][:, self.retrieval_budget + prefix_len:self.retrieval_budget + prefix_len + suffix_len, :, :].copy_(key_states[:, seq_len - suffix_len:seq_len, :, :])
-        self.vbuf[layer_idx][:, self.retrieval_budget + prefix_len:self.retrieval_budget + prefix_len + suffix_len, :, :].copy_(value_states[:, seq_len - suffix_len:seq_len, :, :])
+        self.kbuf[layer_idx][:, :, self.retrieval_budget + prefix_len:self.retrieval_budget + prefix_len + suffix_len, :].copy_(key_states[:, seq_len - suffix_len:seq_len, :, :].permute(0, 2, 1, 3))
+        self.vbuf[layer_idx][:, :, self.retrieval_budget + prefix_len:self.retrieval_budget + prefix_len + suffix_len, :].copy_(value_states[:, seq_len - suffix_len:seq_len, :, :].permute(0, 2, 1, 3))
         self.kvbuf_suffix_len = suffix_len
         
         # (3) save retrieval region to ANNS index
@@ -180,7 +186,10 @@ class DiffCache:
         retrieval_len = min(self.retrieval_region_len, self.retrieval_budget)
 
         # since numpy does not support bfloat16, we use uint16 to store bfloat16 data, and pass to data layer
-        q_cpu = queries.mean(dim=2).squeeze(1).contiguous().view(dtype=torch.uint16).cpu().numpy()
+        group_size = self.num_q_heads // self.num_kv_heads
+        q_cpu = queries.view(self.batch_size, self.num_kv_heads, group_size, self.head_dim) \
+                       .mean(dim=2) \
+                       .contiguous().view(dtype=torch.uint16).cpu().numpy()   # (bsz, num_kv_heads, head_dim)
 
         # data layer query
         data_layer = self.data_layers[layer_idx]
@@ -191,12 +200,12 @@ class DiffCache:
                 data_layer.query(self.kbuf_cpu_np[layer_idx][:, :, :retrieval_len, :], 
                                 self.vbuf_cpu_np[layer_idx][:, :, :retrieval_len, :], 
                                 q_cpu, retrieval_len)
-            self.kbuf[layer_idx][:, self.retrieval_budget - retrieval_len:self.retrieval_budget, :, :].copy_(
-                self.kbuf_cpu[layer_idx][:, :, :retrieval_len, :].permute(0, 2, 1, 3),
+            self.kbuf[layer_idx][:, :, self.retrieval_budget - retrieval_len:self.retrieval_budget, :].copy_(
+                self.kbuf_cpu[layer_idx][:, :, :retrieval_len, :],
                 non_blocking=True
             )
-            self.vbuf[layer_idx][:, self.retrieval_budget - retrieval_len:self.retrieval_budget, :, :].copy_(
-                self.vbuf_cpu[layer_idx][:, :, :retrieval_len, :].permute(0, 2, 1, 3),
+            self.vbuf[layer_idx][:, :, self.retrieval_budget - retrieval_len:self.retrieval_budget, :].copy_(
+                self.vbuf_cpu[layer_idx][:, :, :retrieval_len, :],
                 non_blocking=True
             )
 
@@ -209,8 +218,9 @@ class DiffCache:
             q=queries,
             k=key,
             v=value,
-            k_cache=self.kbuf[layer_idx][:, start:end, :, :], 
-            v_cache=self.vbuf[layer_idx][:, start:end, :, :],
+            cache_seqlens=self.kvbuf_prefix_len + self.kvbuf_suffix_len + retrieval_len,
+            k_cache=self.kbuf[layer_idx][:, :, start:end, :].permute(0, 2, 1, 3),   # convert back to (bsz, seq_len, kh, hd)
+            v_cache=self.vbuf[layer_idx][:, :, start:end, :].permute(0, 2, 1, 3),   # convert back to (bsz, seq_len, kh, hd)
             causal=True
         )
 
@@ -236,18 +246,18 @@ class DiffCache:
         for layer_idx in range(self.num_layers):
             layer_path = os.path.join(prefill_cache_path, f"p_l_{layer_idx:03d}")
             os.makedirs(layer_path, exist_ok=False)
-            torch.save(self.kbuf[layer_idx][:, self.retrieval_budget:self.retrieval_budget + self.kvbuf_prefix_len, :, :], os.path.join(layer_path, "k.pt"))
-            torch.save(self.vbuf[layer_idx][:, self.retrieval_budget:self.retrieval_budget + self.kvbuf_prefix_len, :, :], os.path.join(layer_path, "v.pt"))
+            torch.save(self.kbuf[layer_idx][:, :, self.retrieval_budget:self.retrieval_budget + self.kvbuf_prefix_len, :], os.path.join(layer_path, "k.pt"))
+            torch.save(self.vbuf[layer_idx][:, :, self.retrieval_budget:self.retrieval_budget + self.kvbuf_prefix_len, :], os.path.join(layer_path, "v.pt"))
 
         # save suffix cache
         for layer_idx in range(self.num_layers):
             layer_path = os.path.join(prefill_cache_path, f"s_l_{layer_idx:03d}")
             os.makedirs(layer_path, exist_ok=False)
-            torch.save(self.kbuf[layer_idx][:, self.retrieval_budget + self.kvbuf_prefix_len:self.retrieval_budget + self.kvbuf_prefix_len + self.kvbuf_suffix_len, :, :], os.path.join(layer_path, "k.pt"))
-            torch.save(self.vbuf[layer_idx][:, self.retrieval_budget + self.kvbuf_prefix_len:self.retrieval_budget + self.kvbuf_prefix_len + self.kvbuf_suffix_len, :, :], os.path.join(layer_path, "v.pt"))
+            torch.save(self.kbuf[layer_idx][:, :, self.retrieval_budget + self.kvbuf_prefix_len:self.retrieval_budget + self.kvbuf_prefix_len + self.kvbuf_suffix_len, :], os.path.join(layer_path, "k.pt"))
+            torch.save(self.vbuf[layer_idx][:, :, self.retrieval_budget + self.kvbuf_prefix_len:self.retrieval_budget + self.kvbuf_prefix_len + self.kvbuf_suffix_len, :], os.path.join(layer_path, "v.pt"))
 
         # data layer (for retrieval index)
-        for layer_idx in range(self.num_layers):
+        for layer_idx in tqdm(range(self.num_layers)):
             data_layer = self.data_layers[layer_idx]
             layer_path = os.path.join(prefill_cache_path, f"d_l_{layer_idx:03d}")
             os.makedirs(layer_path, exist_ok=False)
@@ -273,16 +283,16 @@ class DiffCache:
         for layer_idx in range(self.num_layers):
             # prefix load
             prefix_layer_path = os.path.join(prefill_cache_path, f"p_l_{layer_idx:03d}")
-            self.kbuf[layer_idx][:, self.retrieval_budget:self.retrieval_budget + self.kvbuf_prefix_len, :, :] = torch.load(os.path.join(prefix_layer_path, "k.pt"))
-            self.vbuf[layer_idx][:, self.retrieval_budget:self.retrieval_budget + self.kvbuf_prefix_len, :, :] = torch.load(os.path.join(prefix_layer_path, "v.pt"))
+            self.kbuf[layer_idx][:, :, self.retrieval_budget:self.retrieval_budget + self.kvbuf_prefix_len, :] = torch.load(os.path.join(prefix_layer_path, "k.pt"))
+            self.vbuf[layer_idx][:, :, self.retrieval_budget:self.retrieval_budget + self.kvbuf_prefix_len, :] = torch.load(os.path.join(prefix_layer_path, "v.pt"))
 
             # suffix load
             suffix_layer_path = os.path.join(prefill_cache_path, f"s_l_{layer_idx:03d}")
-            self.kbuf[layer_idx][:, self.retrieval_budget + self.kvbuf_prefix_len:self.retrieval_budget + self.kvbuf_prefix_len + self.kvbuf_suffix_len, :, :] = torch.load(os.path.join(suffix_layer_path, "k.pt"))
-            self.vbuf[layer_idx][:, self.retrieval_budget + self.kvbuf_prefix_len:self.retrieval_budget + self.kvbuf_prefix_len + self.kvbuf_suffix_len, :, :] = torch.load(os.path.join(suffix_layer_path, "v.pt"))
+            self.kbuf[layer_idx][:, :, self.retrieval_budget + self.kvbuf_prefix_len:self.retrieval_budget + self.kvbuf_prefix_len + self.kvbuf_suffix_len, :] = torch.load(os.path.join(suffix_layer_path, "k.pt"))
+            self.vbuf[layer_idx][:, :, self.retrieval_budget + self.kvbuf_prefix_len:self.retrieval_budget + self.kvbuf_prefix_len + self.kvbuf_suffix_len, :] = torch.load(os.path.join(suffix_layer_path, "v.pt"))
 
         # data layer
-        for layer_idx in range(self.num_layers):
+        for layer_idx in tqdm(range(self.num_layers)):
             data_layer = self.data_layers[layer_idx]
             layer_path = os.path.join(prefill_cache_path, f"d_l_{layer_idx:03d}")
             data_layer.load(layer_path, ctx_len)

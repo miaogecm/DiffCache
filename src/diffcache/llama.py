@@ -203,7 +203,7 @@ class LlamaModel(BaseModel):
     
 
     def decode_attention(self, query_states, key_states, value_states, layer_idx):
-        return self.kv_cache.compute(query_states, layer_idx)
+        return self.kv_cache.decode_compute_and_update(query_states, key_states, value_states, layer_idx)
 
     
     def mlp(self, hidden_states, layer):

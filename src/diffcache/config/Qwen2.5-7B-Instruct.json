@@ -1,5 +1,5 @@
 {
-    "retrieval_budget": 32,
+    "retrieval_budget": 128,
     "nsw_m": 16,
     "nsw_ef_cons": 200,
     "kvbuf_prefix_len": 128,

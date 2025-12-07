@@ -93,34 +93,40 @@ class BaseModel:
 
 
     def layer_decode(self, layer_idx, hidden_states):
-        #print(f'Layer = {layer_idx}')
+        torch.cuda.synchronize()
+        with Timer("decode_before_attention", logger=None):
+            residual = hidden_states
+            bsz, seq_len, dim = hidden_states.shape
+            layer = self.layers[layer_idx]
 
-        residual = hidden_states
-        bsz, seq_len, dim = hidden_states.shape
-        layer = self.layers[layer_idx]
+            hidden_states = self.layernorm(hidden_states, layer.input_layernorm_variance_epsilon, layer.input_layernorm_weight)
+            
+            query_states, key_states, value_states = self.wqkv(hidden_states, layer)
 
-        hidden_states = self.layernorm(hidden_states, layer.input_layernorm_variance_epsilon, layer.input_layernorm_weight)
-        
-        query_states, key_states, value_states = self.wqkv(hidden_states, layer)
+            query_states, key_states = self.position_embedd(query_states, key_states, self.kv_cache.cached_seq_len(layer_idx))
 
-        query_states, key_states = self.position_embedd(query_states, key_states, self.kv_cache.cached_seq_len(layer_idx))
+            query_states = query_states.view(bsz, -1, self.num_heads, self.head_dim)
+            key_states = key_states.view(bsz, -1, self.num_key_value_heads, self.head_dim)
+            value_states = value_states.view(bsz, -1, self.num_key_value_heads, self.head_dim)
 
-        query_states = query_states.view(bsz, -1, self.num_heads, self.head_dim)
-        key_states = key_states.view(bsz, -1, self.num_key_value_heads, self.head_dim)
-        value_states = value_states.view(bsz, -1, self.num_key_value_heads, self.head_dim)
+            torch.cuda.synchronize()
 
-        with Timer("decode_update_kv_cache", logger=None):
-            key_states, value_states = self.kv_cache.decode_update_kv_cache(key_states, value_states, layer_idx)
+        torch.cuda.synchronize()
         with Timer("decode_attention", logger=None):
             attn_out = self.decode_attention(query_states, key_states, value_states, layer_idx)
+            torch.cuda.synchronize()
 
-        hidden_states = self.wo(attn_out, layer, bsz, seq_len, dim)
-        hidden_states = residual + hidden_states
+        torch.cuda.synchronize()
+        with Timer("decode_after_attention", logger=None):
+            hidden_states = self.wo(attn_out, layer, bsz, seq_len, dim)
+            hidden_states = residual + hidden_states
 
-        residual = hidden_states
-        hidden_states = self.layernorm(hidden_states, layer.post_attention_layernorm_variance_epsilon, layer.post_attention_layernorm_weight)
-        hidden_states = self.mlp(hidden_states, layer)
-        hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.layernorm(hidden_states, layer.post_attention_layernorm_variance_epsilon, layer.post_attention_layernorm_weight)
+            hidden_states = self.mlp(hidden_states, layer)
+            hidden_states = residual + hidden_states
+
+            torch.cuda.synchronize()
 
         return hidden_states
 

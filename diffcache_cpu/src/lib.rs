@@ -13,14 +13,14 @@
 //! (1) insert(self, K, V)                   (KV: (bsz,     kv_head_num, head_dim))
 //!     Insert KV into the cache                 
 //! 
-//! (2) query(self, Q, ef)                   (Q:  (bsz,                  head_dim))
+//! (2) query(self, Q, ef)                   (Q:  (bsz, kv_head_num, head_dim))
 //!                             (ret: (K, V) with (bsz, kv_head_num, ef, head_dim))
 //!                                          (not (bsz, ef, kv_head_num, head_dim) !!!)
 //!     Query the cache with Q to retrieve top ef relevant KVs
 //! 
-#![feature(portable_simd, pointer_is_aligned_to, core_intrinsics, stmt_expr_attributes, iterator_try_collect)]
 
-use std::{cmp::min, ops::{Add, Deref, DerefMut, Div}, sync::{Arc, atomic::{AtomicBool, AtomicUsize}}};
+use std::{cmp::min, ops::{Add, Deref, DerefMut, Div}, sync::{Arc, atomic::{AtomicBool, AtomicUsize}}, time::Instant};
+use metrics::counter;
 use ndarray::{Array, Array1, Array2, Array3, Array4, ArrayView, ArrayView1, ArrayView2, ArrayView3, ArrayView4, ArrayViewMut, ArrayViewMut4, Axis, Data, Dimension, Ix4, ShapeBuilder, Zip, s};
 use numpy::{IntoPyArray, PyArray3, PyArray4, PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4, PyReadwriteArray4};
 use simsimd::{bf16, SpatialSimilarity};
@@ -42,6 +42,30 @@ use tikv_jemallocator::Jemalloc;
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
+
+#[inline(always)]
+pub(crate) fn prefetch_ptr<T, const LOCALITY: i32>(ptr: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::{
+            _mm_prefetch, _MM_HINT_NTA, _MM_HINT_T0, _MM_HINT_T1, _MM_HINT_T2,
+        };
+        if LOCALITY <= 0 {
+            _mm_prefetch(ptr as *const i8, _MM_HINT_NTA);
+        } else if LOCALITY == 1 {
+            _mm_prefetch(ptr as *const i8, _MM_HINT_T2);
+        } else if LOCALITY == 2 {
+            _mm_prefetch(ptr as *const i8, _MM_HINT_T1);
+        } else {
+            _mm_prefetch(ptr as *const i8, _MM_HINT_T0);
+        };
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = ptr;
+    }
+}
 
 pub trait InnerProduct {
     fn dot(a: &[Self], b: &[Self]) -> f32 where Self: Sized;
@@ -174,7 +198,7 @@ pub struct Options {
 }
 
 pub struct DataLayer<T: Clone> {
-    indexes: Vec<Vec<Arc<RwLock<nsw::Index<T>>>>>,       // per batch per KV head index
+    indexes: Vec<nsw::Index<T>>,                         // per batch per KV head index
     ctx_len: usize,                                      // current context length
     bsz: usize,                                          // batch size
     kv_head_num: usize,                                  // number of KV heads
@@ -190,10 +214,8 @@ impl<T: 'static + Send + Sync + Clone + Value + Copy + InnerProduct + L2Square> 
         let mut indexes = vec![];
 
         for _ in 0..bsz {
-            let mut batch_indexes = vec![];
-
             for h in 0..kv_head_num {
-                batch_indexes.push(Arc::new(RwLock::new(nsw::Index::new(
+                indexes.push(nsw::Index::new(
                     head_dim,
                     nsw::Options {
                         n_max: opt.max_ctx_len,
@@ -202,10 +224,8 @@ impl<T: 'static + Send + Sync + Clone + Value + Copy + InnerProduct + L2Square> 
                         r_sq: opt.r_sq[h],
                         name: format!("{}b{:03}h{:03}", opt.name, indexes.len(), h),
                     }
-                ))));
+                ));
             }
-
-            indexes.push(batch_indexes);
         }
 
         DataLayer {
@@ -219,29 +239,26 @@ impl<T: 'static + Send + Sync + Clone + Value + Copy + InnerProduct + L2Square> 
         }
     }
 
-    // keys: (bsz, seq_len, kv_head_num, head_dim)
-    // vals: (bsz, seq_len, kv_head_num, head_dim)
+    // keys: (bsz, kv_head_num, seq_len, head_dim)
+    // vals: (bsz, kv_head_num, seq_len, head_dim)
     // neighbours: (bsz, num_kv_heads, seq_len, deg) u32
     pub fn prefill(&mut self, keys: ArrayView4<T>, vals: ArrayView4<T>, neighbours: ArrayView4<u32>) {
-        let seq_len = keys.shape()[1];
+        let seq_len = keys.shape()[2];
 
-        assert_eq!(keys.shape(), &[self.bsz, seq_len, self.kv_head_num, self.head_dim]);
-        assert_eq!(vals.shape(), &[self.bsz, seq_len, self.kv_head_num, self.head_dim]);
+        assert_eq!(keys.shape(), &[self.bsz, self.kv_head_num, seq_len, self.head_dim]);
+        assert_eq!(vals.shape(), &[self.bsz, self.kv_head_num, seq_len, self.head_dim]);
 
         self.ctx_len = seq_len;
 
-        let tasks: Vec<(usize, usize)> = (0..self.bsz)
-            .flat_map(|b| (0..self.kv_head_num).map(move |kh| (b, kh)))
-            .collect();
+        self.indexes.par_iter_mut().enumerate().for_each(|(idx, index)| {
+            let b = idx / self.kv_head_num;
+            let kh = idx % self.kv_head_num;
 
-        tasks.into_par_iter().for_each(|(b, kh)| {
-            let keys = keys.slice(s![b, .., kh, ..]);
-            let vals = vals.slice(s![b, .., kh, ..]);
+            let keys = keys.slice(s![b, kh, .., ..]);
+            let vals = vals.slice(s![b, kh, .., ..]);
             let neighbours = neighbours.slice(s![b, kh, .., ..]);
 
-            let index = self.indexes[b][kh].clone();
-            let mut index = index.write().unwrap();
-            index.prefill(keys, vals, neighbours.view()).unwrap();
+            index.prefill(keys, vals, neighbours).unwrap();
         });
     }
 
@@ -254,35 +271,34 @@ impl<T: 'static + Send + Sync + Clone + Value + Copy + InnerProduct + L2Square> 
 
         self.ctx_len += 1;
 
-        let tasks: Vec<(usize, usize)> = (0..self.bsz)
-            .flat_map(|b| (0..self.kv_head_num).map(move |kh| (b, kh)))
-            .collect();
-
         let ep = ArrayView1::<Neighbour>::from(&[]);
 
-        tasks.into_par_iter().for_each(|(b, kh)| {
-            let index = self.indexes[b][kh].clone();
+        self.indexes.par_iter_mut().enumerate().for_each(|(idx, index)| {
+            let b = idx / self.kv_head_num;
+            let kh = idx % self.kv_head_num;
+
             let key = keys.slice(s![b, kh, ..]);
             let val = vals.slice(s![b, kh, ..]);
 
-            let mut index = index.write().unwrap();
-            index.insert(key.view(), val.view(), ep.view()).unwrap();
+            index.insert(key, val, ep).unwrap();
         });
     }
 
     // out:     (bsz, kv_head_num, ef, head_dim)
-    // queries: (bsz,            , head_dim)
-    pub fn query(&self, out_keys: ArrayViewMut4<T>, out_vals: ArrayViewMut4<T>, queries: ArrayView2<T>, ef: usize) {
+    // queries: (bsz, kv_head_num, head_dim)
+    pub fn query(&self, out_keys: ArrayViewMut4<T>, out_vals: ArrayViewMut4<T>, queries: ArrayView3<T>, ef: usize) {
         let ef = min(ef, self.ctx_len);
 
-        assert_eq!(queries.shape(), &[self.bsz, self.head_dim]);
+        assert_eq!(queries.shape(), &[self.bsz, self.kv_head_num, self.head_dim]);
 
         let search_bruteforce = self.opt.use_bruteforce;
 
         let ep = ArrayView1::<Neighbour>::from(&[]);
 
-        let mut flat_keys = out_keys.to_shape((self.bsz * self.kv_head_num, ef, self.head_dim)).unwrap();
-        let mut flat_vals = out_vals.to_shape((self.bsz * self.kv_head_num, ef, self.head_dim)).unwrap();
+        let start = Instant::now();
+
+        let mut flat_keys = out_keys.into_shape_with_order((self.bsz * self.kv_head_num, ef, self.head_dim)).unwrap();
+        let mut flat_vals = out_vals.into_shape_with_order((self.bsz * self.kv_head_num, ef, self.head_dim)).unwrap();
 
         flat_keys.axis_iter_mut(Axis(0)).into_par_iter().zip(flat_vals.axis_iter_mut(Axis(0)).into_par_iter())
             .enumerate()
@@ -290,16 +306,17 @@ impl<T: 'static + Send + Sync + Clone + Value + Copy + InnerProduct + L2Square> 
                 let b = idx / self.kv_head_num;
                 let kh = idx % self.kv_head_num;
 
-                let query = queries.slice(s![b, ..]);
+                let query = queries.slice(s![b, kh, ..]);
 
-                let index = self.indexes[b][kh].clone();
-                let index = index.read().unwrap();
+                let index = &self.indexes[b * self.kv_head_num + kh];
                 if !search_bruteforce {
-                    index.search(query.view(), ef, ep.view(), out_keys_slice, out_vals_slice);
+                    index.search(query, ef, ep, out_keys_slice, out_vals_slice);
                 } else {
-                    index.search_bruteforce(query.view(), ef, out_keys_slice, out_vals_slice);
+                    index.search_bruteforce(query, ef, out_keys_slice, out_vals_slice);
                 }
             });
+
+        counter!(format!("{}_total_query_latency", self.opt.name)).increment(start.elapsed().as_micros() as u64);
     }
 
     pub fn save(&self, prefix: &str) {
@@ -308,9 +325,8 @@ impl<T: 'static + Send + Sync + Clone + Value + Copy + InnerProduct + L2Square> 
             .collect();
 
         tasks.into_par_iter().for_each(|(b, kh)| {
-            let index = self.indexes[b][kh].clone();
+            let index = &self.indexes[b * self.kv_head_num + kh];
             let path = format!("{}b{:03}_h{:03}.idx", prefix, b, kh);
-            let index = index.read().unwrap();
             index.save(&path).unwrap();
         });
     }
@@ -318,14 +334,11 @@ impl<T: 'static + Send + Sync + Clone + Value + Copy + InnerProduct + L2Square> 
     pub fn load(&mut self, prefix: &str, ctx_len: usize) {
         self.ctx_len = ctx_len;
 
-        let tasks: Vec<(usize, usize)> = (0..self.bsz)
-            .flat_map(|b| (0..self.kv_head_num).map(move |kh| (b, kh)))
-            .collect();
+        self.indexes.par_iter_mut().enumerate().for_each(|(idx, index)| {
+            let b = idx / self.kv_head_num;
+            let kh = idx % self.kv_head_num;
 
-        tasks.into_par_iter().for_each(|(b, kh)| {
-            let index = self.indexes[b][kh].clone();
             let path = format!("{}b{:03}_h{:03}.idx", prefix, b, kh);
-            let mut index = index.write().unwrap();
             *index = nsw::Index::load(&path).unwrap();
         });
     }
@@ -335,8 +348,7 @@ impl<T: 'static + Send + Sync + Clone + Value + Copy + InnerProduct + L2Square> 
         
         for b in 0..self.bsz {
             for kh in 0..self.kv_head_num {
-                let index = self.indexes[b][kh].clone();
-                let index = index.read().unwrap();
+                let index = &self.indexes[b * self.kv_head_num + kh];
                 let key_view = index.get_keys(self.ctx_len);
                 keys.slice_mut(s![b, kh, .., ..]).assign(&key_view);
             }
@@ -435,7 +447,7 @@ impl DiffCacheCPU {
         &self,
         mut out_keys: PyReadwriteArray4<'py, u16>,
         mut out_vals: PyReadwriteArray4<'py, u16>,
-        queries: PyReadonlyArray2<'py, u16>,
+        queries: PyReadonlyArray3<'py, u16>,
         ef: usize,
     ) {
         let out_keys = view_u16_as_bf16_mut(out_keys.as_array_mut());
@@ -460,14 +472,9 @@ impl DiffCacheCPU {
     fn update_r_sq(&mut self, r_sq: Vec<f32>) {
         assert!(r_sq.len() == self.data_layer.kv_head_num, "r_sq length must match kv_head_num");
 
-        let tasks = (0..self.data_layer.bsz)
-            .flat_map(|b| (0..self.data_layer.kv_head_num).map(move |kh| (b, kh)))
-            .collect::<Vec<_>>();
-
-        tasks.into_par_iter().for_each(|(b, kh)| {
-            let index = self.data_layer.indexes[b][kh].clone();
+        self.data_layer.indexes.par_iter_mut().enumerate().for_each(|(idx, index)| {
+            let kh = idx % self.data_layer.kv_head_num;
             let r_sq = r_sq[kh];
-            let mut index = index.write().unwrap();
             index.update_r_sq(r_sq);
         });
     }

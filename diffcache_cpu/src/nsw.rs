@@ -1,5 +1,5 @@
-use crate::{Distance, HugeArray, L2Square, Neighbour, NodeID};
-use std::{array, cmp::{Reverse, max, min}, collections::{BinaryHeap, HashSet}, f32, intrinsics::{prefetch_read_data, sqrtf32}, io::{BufReader, BufWriter}, iter::repeat_with, marker::PhantomData, ops::{Add, Div}, path::Path, sync::atomic::Ordering, time::Instant};
+use crate::{Distance, HugeArray, L2Square, Neighbour, NodeID, prefetch_ptr};
+use std::{array, cmp::{Reverse, max, min}, collections::{BinaryHeap, HashSet}, f32, io::{BufReader, BufWriter}, iter::repeat_with, marker::PhantomData, ops::{Add, Div}, path::Path, sync::atomic::Ordering, time::Instant};
 use crate::{Value};
 use std::cell::RefCell;
 use super::tlset::TLSet;
@@ -97,7 +97,7 @@ fn prefetch_slice<T, const LOCALITY: i32, const LINES: i32>(slice: &[T]) {
     let mut a = base & !(CL - 1);
     let end = min((base + bytes + CL - 1) & !(CL - 1), a + (LINES as usize) * CL);
     while a < end {
-        prefetch_read_data::<_, LOCALITY>(a as *const u8);
+        prefetch_ptr::<_, LOCALITY>(a as *const u8);
         a += CL;
     }
 }
@@ -113,13 +113,14 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
             DistMode::QKDist => {
                 // mean(|q'-k'|^2) = mean(|q|^2 + |k|^2 + (r^2 - |k|^2) - 2q.k) = mean(|q|^2 + r^2) - 2q.k = constant - 2q.k
                 // FIXME: we assume that 65536.0 - T::dot(a, b) >= 0
+                // assert!(T::dot(a, b) <= 65536.0, "Inner product exceeds maximum allowed value");
                 65536.0 - T::dot(a, b)
             },
 
             DistMode::KKDist => {
                 // |k1'-k2'|^2 = |k1 - k2|^2 + (sqrt(r^2 - |k1|^2) - sqrt(r^2 - |k2|^2))^2
                 //             = 2r^2 - 2k1.k2 - 2sqrt(r^2 - |k1|^2)sqrt(r^2 - |k2|^2)
-                let (s1, s2) = (sqrtf32(f32::max(r_sq - T::dot(a, a), 0.0)), sqrtf32(f32::max(r_sq - T::dot(b, b), 0.0)));
+                let (s1, s2) = (f32::sqrt(f32::max(r_sq - T::dot(a, a), 0.0)), f32::sqrt(f32::max(r_sq - T::dot(b, b), 0.0)));
                 r_sq - T::dot(a, b) - s1 * s2
             }
         }
@@ -150,7 +151,7 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
     fn get_print_key(&self, id: NodeID) -> Vec<f32> {
         let start = self.get_offset(id);
         let mut key: Vec<f32> = self.keys[start..start + self.dim].iter().map(|v| v.to_f32()).collect();
-        key.push(sqrtf32(self.options.r_sq - T::dot(&self.keys[start..start + self.dim], &self.keys[start..start + self.dim])));
+        key.push(f32::sqrt(self.options.r_sq - T::dot(&self.keys[start..start + self.dim], &self.keys[start..start + self.dim])));
         key
     }
 
@@ -194,7 +195,7 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
             let peek: Neighbour = (*peek).into();
             let candidate = self.get_node(peek.node);
 
-            prefetch_read_data::<_, 3>(candidate as *const _ as *const u8);
+            prefetch_ptr::<_, 3>(candidate as *const _ as *const u8);
 
             // early stopping condition
             if peek.dist > furthest && nns.len() >= ef {
@@ -328,6 +329,7 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
         // insert keys and vals
         self.keys[..n * self.dim].copy_from_slice(keys.as_slice().unwrap());
         self.vals[..n * self.dim].copy_from_slice(vals.as_slice().unwrap());
+        self.num_nodes = n;
 
         // build conns
         assert!(deg <= self.m_max, "Number of neighbors exceeds maximum allowed");
@@ -356,8 +358,7 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
             None
         } else {
             // ramdom entry point
-            let node_id = (self.num_nodes as f32 * rand::random::<f32>()) as NodeID;
-            assert!(node_id < self.num_nodes as NodeID, "Random entry point node ID out of range");
+            let node_id = (self.num_nodes / 2) as NodeID;
             let dist = self.distance(key, self.get_key(node_id), dist_mode);
             Some(vec![Neighbour { dist, node: node_id }])
         }
@@ -455,7 +456,8 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
     pub fn search(&self, query: ArrayView1<T>, ef: usize, ep: ArrayView1<Neighbour>, mut out_keys: ArrayViewMut2<T>, mut out_vals: ArrayViewMut2<T>) {
         assert_eq!(query.shape()[0], self.dim, "Query dimension does not match index dimension");
         let query = query.as_slice().unwrap();
-        let ep = self.get_ep(query, ep.as_slice().unwrap(), &DistMode::QKDist).unwrap();
+        let ep = ep.as_slice().unwrap();
+        let ep = self.get_ep(query, ep, &DistMode::QKDist).unwrap();
 
         counter!(format!("{}_num_searches", self.options.name)).increment(1);
 
@@ -476,6 +478,9 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
             out_keys.slice_mut(s![i, ..key_slice.len()]).assign(&ArrayView1::from(key_slice));
             out_vals.slice_mut(s![i, ..val_slice.len()]).assign(&ArrayView1::from(val_slice));
         }
+
+        let collect_time = start.elapsed().as_micros() as usize - search_time;
+        counter!(format!("{}_collect_latency", self.options.name)).increment(collect_time as u64);
     }
 
     pub fn new(dim: usize, options: Options) -> Self {

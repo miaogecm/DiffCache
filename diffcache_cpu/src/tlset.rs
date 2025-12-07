@@ -64,7 +64,16 @@ impl<'a> Handle<'a> {
 
     #[inline]
     pub(crate) fn prefetch(&self, item: usize) {
-        unsafe { std::intrinsics::prefetch_write_data::<_, 2>(self.set.items.as_ptr().add(item) as *const _) };
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        unsafe {
+            use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            let ptr = self.set.items.as_ptr().add(item) as *const i8;
+            _mm_prefetch(ptr, _MM_HINT_T0);
+        }
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            let _ = (&self, item);
+        }
     }
 
     #[inline]
