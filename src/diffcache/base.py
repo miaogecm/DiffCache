@@ -4,6 +4,7 @@ from termcolor import colored
 from tqdm import tqdm
 from codetiming import Timer
 import os
+from flash_attn import flash_attn_with_kvcache
 
 
 class BaseModel:
@@ -35,8 +36,25 @@ class BaseModel:
         # TODO: only bf16 is supported for now
         assert(dtype == torch.bfloat16), "Only torch.bfloat16 is supported for now."
 
+    def post_model_init(self):
+        self.decode_pre_attn_graphs = [torch.cuda.CUDAGraph() for _ in range(self.num_layers)]
+        self.decode_post_attn_graphs = [torch.cuda.CUDAGraph() for _ in range(self.num_layers)]
 
-    def layer_prefill(self, layer_idx, hidden_states):
+        self.kcache = [None for _ in range(self.num_layers)]
+        self.vcache = [None for _ in range(self.num_layers)]
+
+    def post_init_kv_cache(self):
+        self.decode_hidden_states = torch.empty((self.batch_size, 1, self.hidden_size), dtype=self.dtype, device=self.device_map)
+        self.decode_query_states = [None for _ in range(self.num_layers)]
+        self.decode_key_states = [None for _ in range(self.num_layers)]
+        self.decode_value_states = [None for _ in range(self.num_layers)]
+        self.decode_position_ids = torch.zeros((self.batch_size, 1), dtype=torch.int32, device=self.device_map)
+        self.decode_cache_seqlens = torch.zeros((self.batch_size,), dtype=torch.int32, device=self.device_map)
+
+        for layer_idx in range(self.num_layers):
+            self.build_layer_decode_graphs(layer_idx)
+
+    def layer_prefill(self, layer_idx, hidden_states, chunk_size=8192):
         # print(f'Layer = {layer_idx}')
         bsz, seq_len, dim = hidden_states.shape
         layer = self.layers[layer_idx]
@@ -45,8 +63,8 @@ class BaseModel:
         temp_hidden_states = hidden_states.clone()
 
         # chunk for lower memory comsumption
-        for start_idx in range(0, seq_len, 8192//bsz):
-            end_idx = min(seq_len, start_idx + 8192//bsz)
+        for start_idx in range(0, seq_len, chunk_size // bsz):
+            end_idx = min(seq_len, start_idx + chunk_size // bsz)
             temp_hidden_states[:, start_idx:end_idx, :] = self.layernorm(temp_hidden_states[:, start_idx:end_idx, :], 
                                                                          layer.input_layernorm_variance_epsilon, 
                                                                          layer.input_layernorm_weight)
@@ -61,10 +79,14 @@ class BaseModel:
         key_states = key_states.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
         value_states = value_states.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
 
-        key_states, value_states = self.kv_cache.prefill_update_kv_cache(key_states, value_states, layer_idx)
-        torch.cuda.empty_cache()
+        with Timer(f"prefill_update", logger=None):
+            key_states, value_states = self.kv_cache.prefill_update_kv_cache(key_states, value_states, layer_idx)
+            torch.cuda.empty_cache()
 
-        temp_attn_out = self.prefill_attention(query_states, key_states, value_states)
+        torch.cuda.synchronize()
+        with Timer(f"prefill_attn", logger=None):
+            temp_attn_out = self.prefill_attention(query_states, key_states, value_states)
+            torch.cuda.synchronize()
 
         del query_states, key_states, value_states
         torch.cuda.empty_cache()
@@ -77,8 +99,8 @@ class BaseModel:
         residual = hidden_states.clone()
 
         # chunk for lower memory comsumption
-        for start_idx in range(0, seq_len, 8192//bsz):
-            end_idx = min(seq_len, start_idx + 8192//bsz)
+        for start_idx in range(0, seq_len, chunk_size // bsz):
+            end_idx = min(seq_len, start_idx + chunk_size // bsz)
             hidden_states[:, start_idx:end_idx, :] = self.layernorm(hidden_states[:, start_idx:end_idx, :], 
                                                                     layer.post_attention_layernorm_variance_epsilon, 
                                                                     layer.post_attention_layernorm_weight)
@@ -90,46 +112,47 @@ class BaseModel:
         torch.cuda.empty_cache()
                                                                                                    
         return hidden_states
+    
+    def build_layer_decode_graphs(self, layer_idx):
+        bsz, seq_len, dim = self.decode_hidden_states.shape
+        layer = self.layers[layer_idx]
 
-
-    def layer_decode(self, layer_idx, hidden_states):
-        torch.cuda.synchronize()
-        with Timer("decode_before_attention", logger=None):
-            residual = hidden_states
-            bsz, seq_len, dim = hidden_states.shape
-            layer = self.layers[layer_idx]
-
-            hidden_states = self.layernorm(hidden_states, layer.input_layernorm_variance_epsilon, layer.input_layernorm_weight)
-            
+        # pre-attention graph
+        with torch.cuda.graph(self.decode_pre_attn_graphs[layer_idx]):
+            hidden_states = self.layernorm(self.decode_hidden_states, layer.input_layernorm_variance_epsilon, layer.input_layernorm_weight)
             query_states, key_states, value_states = self.wqkv(hidden_states, layer)
+            query_states, key_states = self.apply_rotary_pos_emb(query_states, key_states, self.decode_position_ids)
+            self.kv_cache.decode_pre_query_operation(query_states)
+        
+        self.decode_query_states[layer_idx] = query_states.view(bsz, -1, self.num_heads, self.head_dim)
+        self.decode_key_states[layer_idx] = key_states.view(bsz, -1, self.num_key_value_heads, self.head_dim)
+        self.decode_value_states[layer_idx] = value_states.view(bsz, -1, self.num_key_value_heads, self.head_dim)
 
-            query_states, key_states = self.position_embedd(query_states, key_states, self.kv_cache.cached_seq_len(layer_idx))
-
-            query_states = query_states.view(bsz, -1, self.num_heads, self.head_dim)
-            key_states = key_states.view(bsz, -1, self.num_key_value_heads, self.head_dim)
-            value_states = value_states.view(bsz, -1, self.num_key_value_heads, self.head_dim)
-
-            torch.cuda.synchronize()
-
-        torch.cuda.synchronize()
-        with Timer("decode_attention", logger=None):
-            attn_out = self.decode_attention(query_states, key_states, value_states, layer_idx)
-            torch.cuda.synchronize()
-
-        torch.cuda.synchronize()
-        with Timer("decode_after_attention", logger=None):
+        # post-attention graph
+        with torch.cuda.graph(self.decode_post_attn_graphs[layer_idx]):
+            self.kv_cache.decode_post_query_operation(layer_idx)
+            attn_out = flash_attn_with_kvcache(
+                q=self.decode_query_states[layer_idx],
+                k=self.decode_key_states[layer_idx],
+                v=self.decode_value_states[layer_idx],
+                cache_seqlens=self.decode_cache_seqlens,
+                k_cache=self.kcache[layer_idx],
+                v_cache=self.vcache[layer_idx],
+                causal=True
+            )
             hidden_states = self.wo(attn_out, layer, bsz, seq_len, dim)
-            hidden_states = residual + hidden_states
-
+            hidden_states = self.decode_hidden_states + hidden_states
             residual = hidden_states
             hidden_states = self.layernorm(hidden_states, layer.post_attention_layernorm_variance_epsilon, layer.post_attention_layernorm_weight)
             hidden_states = self.mlp(hidden_states, layer)
-            hidden_states = residual + hidden_states
+            torch.add(hidden_states, residual, out=self.decode_hidden_states)
 
-            torch.cuda.synchronize()
-
-        return hidden_states
-
+    def layer_decode(self, layer_idx):
+        self.decode_position_ids.fill_(self.kv_cache.seq_len(layer_idx))
+        self.decode_cache_seqlens.fill_(self.kv_cache.seq_len_gpu(layer_idx))
+        self.decode_pre_attn_graphs[layer_idx].replay()
+        self.kv_cache.decode_query_kvcache(layer_idx)
+        self.decode_post_attn_graphs[layer_idx].replay()
 
     def do_prefill_forward(self, inputs_ids, prefill_cache_path):
         bsz, seq_len = inputs_ids.shape
@@ -152,7 +175,6 @@ class BaseModel:
         
         return logits
     
-
     # get prefill cache with matching input_ids
     def get_prefill_cache_path(self, input_ids):
         if self.prefill_cache_dir is None:
@@ -189,18 +211,16 @@ class BaseModel:
             logits = torch.load(os.path.join(prefill_cache_path, "logits.pt"))
             return logits
 
-
     def decode_forward(self, inputs_ids):
-        hidden_states = self.word_embedding(inputs_ids)
+        self.decode_hidden_states.copy_(self.word_embedding(inputs_ids))
 
         for ldx in range(self.num_layers):
-            hidden_states = self.layer_decode(ldx, hidden_states)
+            self.layer_decode(ldx)
         
-        hidden_states = self.layernorm(hidden_states[:, -1:, :], self.norm_variance_epsilon, self.norm_weight)
+        hidden_states = self.layernorm(self.decode_hidden_states[:, -1:, :], self.norm_variance_epsilon, self.norm_weight)
         logits = self.lm(hidden_states)
         
         return logits
-
 
     def inference(self, inputs_ids):
         outputs_ids = []    # multi iteration, multi request
@@ -217,6 +237,11 @@ class BaseModel:
         torch.cuda.synchronize()
         prefill_end = time.time()
         print(colored(f"Prefilling latency: {round((prefill_end - prefill_start), 4)} s\n", 'green'))
+
+        for layer_idx in range(self.num_layers):
+            self.kcache[layer_idx], self.vcache[layer_idx] = self.kv_cache.get_kvcache(layer_idx)
+
+        self.post_init_kv_cache()
 
         batch_size = inputs_ids.shape[0]
         finished = torch.zeros(batch_size, dtype=torch.bool, device=inputs_ids.device)
@@ -251,7 +276,6 @@ class BaseModel:
         outputs_ids = torch.cat(outputs_ids, dim=-1).tolist()
         
         return outputs_ids
-
 
     def generate(self, inputs_ids, attention_masks, max_new_length, attn_config=None):
         """ LLM Inference.

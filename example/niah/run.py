@@ -33,7 +33,7 @@ def load_model(model_name, max_len, dtype):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Prefill teacher model, extract RoPE-augmented Q/K at a given layer/head, and dump question-K and answer-Q.")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--book_path", type=str, default="../.data/war-and-peace-128k.txt")
     parser.add_argument("--needle_ratio", type=float, default=0.5, help="Insertion ratio in [0,1].")

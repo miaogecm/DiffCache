@@ -24,6 +24,8 @@ class QwenLayer:
         self.device = device
     
     def init_layer(self, hf_qwen_layer):
+        start = torch.cuda.memory_allocated() / 1024**3
+
         self.wq = hf_qwen_layer.self_attn.q_proj.weight.detach()
         self.wk = hf_qwen_layer.self_attn.k_proj.weight.detach()
         self.wv = hf_qwen_layer.self_attn.v_proj.weight.detach()
@@ -45,7 +47,11 @@ class QwenLayer:
         self.post_attention_layernorm_weight = hf_qwen_layer.post_attention_layernorm.weight.detach().to(self.device, non_blocking=True)
         self.post_attention_layernorm_variance_epsilon = hf_qwen_layer.post_attention_layernorm.variance_epsilon
 
-        del self.wq, self.wk, self.wv, self.bq, self.bk, self.bv
+        del self.wq, self.wk, self.wv, self.bq, self.bk, self.bv, self.gate_proj, self.up_proj
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # print(f"Layer {self.layer_idx} init, memory used: {torch.cuda.memory_allocated() / 1024**3 - start:.2f} GB")
 
 
 class QwenModel(BaseModel):
@@ -74,6 +80,7 @@ class QwenModel(BaseModel):
 
         self.init_model()
 
+        self.post_model_init()
 
     def init_model(self):
         hf_qwen = Qwen2ForCausalLM.from_pretrained(
@@ -85,6 +92,7 @@ class QwenModel(BaseModel):
                 "original_max_position_embeddings": 32768,
             },
             max_position_embeddings=131072,
+            device_map="cpu"
         )
 
         self.hf_rotary_emb = hf_qwen.model.rotary_emb
@@ -98,10 +106,12 @@ class QwenModel(BaseModel):
         self.position_ids = torch.arange(0, self.max_length).to(self.device_map, non_blocking=True)
         self.inv_freq = hf_qwen.model.rotary_emb.inv_freq.detach().to(self.device_map, non_blocking=True)
         self.attention_scaling = hf_qwen.model.rotary_emb.attention_scaling
-        cos, sin = hf_qwen.model.rotary_emb(torch.empty(1, dtype=torch.float32).cuda(), self.position_ids.unsqueeze(0))
-        half_dim = self.head_dim // 2
-        cos_half, sin_half = cos[0, :, :half_dim], sin[0, :, :half_dim]
-        self.cos_sin_cache = torch.cat((cos_half, sin_half), dim=-1).contiguous()
+        cos, sin = hf_qwen.model.rotary_emb(torch.empty(1, dtype=torch.bfloat16).cuda(), self.position_ids.unsqueeze(0))
+        #half_dim = self.head_dim // 2
+        #cos_half, sin_half = cos[0, :, :half_dim], sin[0, :, :half_dim]
+        #self.cos_sin_cache = torch.cat((cos_half, sin_half), dim=-1).contiguous()
+        self.cos_cache = cos
+        self.sin_cache = sin
 
         self.layers = []
         for idx, hf_qwen_layer in enumerate(hf_qwen.model.layers):
@@ -110,11 +120,10 @@ class QwenModel(BaseModel):
             self.layers.append(qwen_layer)
             hf_qwen.model.layers[idx] = None
 
-        del self.inv_freq, cos, sin
+        #del cos, sin
         gc.collect()
         torch.cuda.empty_cache()
 
-    
     def init_kv_cache(self, real_input_length, valid_start, attn_config=None):
         if attn_config is None:
             PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -148,7 +157,6 @@ class QwenModel(BaseModel):
         )
         print(f"KVCache init")
 
-    
     def calc_r_sq(self):
         r_sq = []
         dim = self.hidden_size
@@ -191,29 +199,24 @@ class QwenModel(BaseModel):
 
         return r_sq
 
-    
     def word_embedding(self, inputs_id):
         hidden_states = F.embedding(inputs_id, self.embed_tokens)
         return hidden_states
 
-    
     def lm(self, hidden_states):
         logits = F.linear(hidden_states, self.lm_head).float()
         return logits
-
 
     def wqkv(self, hidden_states, layer):
         qkv = F.linear(hidden_states, layer.wqkv, layer.bqkv)
         query_states, key_states, value_states = qkv.split([self.hidden_size, self.hidden_size//self.num_key_value_groups, self.hidden_size//self.num_key_value_groups], dim=-1)
         return query_states, key_states, value_states
 
-    
     def wo(self, hidden_states, layer, bsz, seq_len, dim):
         hidden_states = hidden_states.reshape(bsz, seq_len, dim)
         hidden_states = F.linear(hidden_states, layer.wo)
         return hidden_states
 
-    
     def prefill_attention(self, query_states, key_states, value_states):
         return flash_attn_func(
             q=query_states, 
@@ -221,12 +224,7 @@ class QwenModel(BaseModel):
             v=value_states,
             causal=True
         )
-    
 
-    def decode_attention(self, query_states, key_states, value_states, layer_idx):
-        return self.kv_cache.decode_compute_and_update(query_states, key_states, value_states, layer_idx)
-
-    
     def mlp(self, hidden_states, layer):
         hidden_states = F.linear(hidden_states, layer.gate_up_proj)
         dim = hidden_states.shape[-1] // 2
@@ -236,14 +234,12 @@ class QwenModel(BaseModel):
         hidden_states = F.linear(out, layer.down_proj)
         return hidden_states 
 
-    
     def layernorm(self, hidden_states, epsilon, weight):
         bsz, seq_len, dim = hidden_states.shape
         hidden_states = hidden_states.reshape(bsz * seq_len, dim)
         hidden_states = flashinfer.rmsnorm(hidden_states, weight, epsilon)
         hidden_states = hidden_states.reshape(bsz, seq_len, dim)
         return hidden_states
-
 
     # TODO: bug in context length > 32k
     def _apply_rotary_pos_emb_buggy(self, query_states, key_states, position_ids):
@@ -257,14 +253,23 @@ class QwenModel(BaseModel):
         key_states = key_states.view(bsz, -1, kv_dim)
         return query_states, key_states
     
-
+    def _hf_rotary_emb(self, x, position_ids):
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        position_ids_expanded = position_ids[:, None, :].float()
+        with torch.autocast(device_type=x.device.type, enabled=False):  # Force float32
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() * self.attention_scaling
+            sin = emb.sin() * self.attention_scaling
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+    
     def apply_rotary_pos_emb(self, query_states, key_states, position_ids):
         q = query_states.reshape(self.batch_size, -1, self.num_heads, self.head_dim)
         k = key_states.reshape(self.batch_size, -1, self.num_key_value_heads, self.head_dim)
-        cos, sin = self.hf_rotary_emb(k, position_ids)
+        #cos, sin = self.cos_cache[:, position_ids, :], self.sin_cache[:, position_ids, :]
+        cos, sin = self._hf_rotary_emb(q, position_ids)
         q_rot, k_rot = hf_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=2)
         return q_rot.view_as(query_states), k_rot.view_as(key_states)
-
 
     def position_embedd(self, query_states, key_states, cached_seq_len):
         bsz, seq_len, _ = key_states.shape

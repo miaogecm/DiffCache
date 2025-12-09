@@ -3,7 +3,6 @@ from typing import List
 from codetiming import Timer
 import torch
 
-from flash_attn import flash_attn_with_kvcache
 from tqdm import tqdm
 from .._cpu import DiffCacheCPU, init_metrics
 from cuvs.neighbors import cagra
@@ -76,9 +75,11 @@ class DiffCache:
             device='cpu',
             dtype=torch.bfloat16,
         ).pin_memory() for _ in range(num_layers)]
+        self.qbuf_cpu = torch.zeros((batch_size, num_kv_heads, head_dim), device='cpu', dtype=torch.bfloat16).pin_memory()
         # since numpy does not support bfloat16, we use uint16 to store bfloat16 data, and pass to data layer
         self.kbuf_cpu_np = [buf.view(dtype=torch.uint16).numpy() for buf in self.kbuf_cpu]
         self.vbuf_cpu_np = [buf.view(dtype=torch.uint16).numpy() for buf in self.vbuf_cpu]
+        self.qbuf_cpu_np = self.qbuf_cpu.view(dtype=torch.uint16).numpy()
 
         # initialize data layer
         for layer_idx in range(num_layers):
@@ -107,29 +108,32 @@ class DiffCache:
         values = value_states.view(self.batch_size, value_states.size(1), value_states.size(2), value_states.size(3))
         deg = 2 * self.nsw_m
         seq_len = key_states.size(1)
-        
-        # build data layer using CAGRA
-        neighbours = np.empty((self.batch_size, self.num_kv_heads, seq_len, deg), dtype=np.uint32)
 
-        for b in range(self.batch_size):
-            for h in range(self.num_kv_heads):
-                k = keys[b, :, h, :].to(torch.float32)  # (seq_len, head_dim)
+        torch.cuda.synchronize()
+        with Timer(f"cagra_build", logger=None):
+            # build data layer using CAGRA
+            neighbours = np.empty((self.batch_size, self.num_kv_heads, seq_len, deg), dtype=np.uint32)
 
-                # lift dim
-                norm_sq = (k * k).sum(dim=1, keepdim=True)
-                extra = torch.sqrt(torch.clamp(self.r_sq[layer_idx][h] - norm_sq, min=0.0))
-                k = torch.cat([k, extra], dim=1)  # (seq_len, head_dim + 1)
+            for b in range(self.batch_size):
+                for h in range(self.num_kv_heads):
+                    k = keys[b, :, h, :].to(torch.float32)  # (seq_len, head_dim)
 
-                # build index and extract graph
-                build_params = cagra.IndexParams(
-                    metric="sqeuclidean", 
-                    graph_degree=deg,
-                    intermediate_graph_degree=4 * deg,
-                )
-                index = cagra.build(build_params, k)
-                neighbours[b, h, :, :] = index.graph.copy_to_host()
+                    # lift dim
+                    norm_sq = (k * k).sum(dim=1, keepdim=True)
+                    extra = torch.sqrt(torch.clamp(self.r_sq[layer_idx][h] - norm_sq, min=0.0))
+                    k = torch.cat([k, extra], dim=1)  # (seq_len, head_dim + 1)
 
-                del index, k, norm_sq, extra
+                    # build index and extract graph
+                    build_params = cagra.IndexParams(
+                        metric="sqeuclidean", 
+                        graph_degree=deg,
+                        intermediate_graph_degree=4 * deg,
+                    )
+                    index = cagra.build(build_params, k)
+                    neighbours[b, h, :, :] = index.graph.copy_to_host()
+
+                    del index, k, norm_sq, extra
+            torch.cuda.synchronize()
 
         # CPU prefill
         data_layer = self.data_layers[layer_idx]
@@ -174,60 +178,45 @@ class DiffCache:
         self.retrieval_region_len = retrieval_key_states.size(1)
 
         return key_states, value_states
-    
 
-    def decode_compute_and_update(
-        self,
-        queries: torch.Tensor,        # (bsz, 1, num_q_heads, head_dim)
-        key: torch.Tensor,            # (bsz, 1, num_kv_heads, head_dim) 
-        value: torch.Tensor,          # (bsz, 1, num_kv_heads, head_dim)
-        layer_idx
-    ):
+    def get_kvcache(self, layer_idx):
         retrieval_len = min(self.retrieval_region_len, self.retrieval_budget)
-
-        # since numpy does not support bfloat16, we use uint16 to store bfloat16 data, and pass to data layer
-        group_size = self.num_q_heads // self.num_kv_heads
-        q_cpu = queries.view(self.batch_size, self.num_kv_heads, group_size, self.head_dim) \
-                       .mean(dim=2) \
-                       .contiguous().view(dtype=torch.uint16).cpu().numpy()   # (bsz, num_kv_heads, head_dim)
-
-        # data layer query
-        data_layer = self.data_layers[layer_idx]
-
-        # retrieved KV: (bsz, num_kv_heads, retrieval_len, head_dim)
-        if retrieval_len > 0:
-            with Timer("data_layer_query", logger=None):
-                data_layer.query(self.kbuf_cpu_np[layer_idx][:, :, :retrieval_len, :], 
-                                self.vbuf_cpu_np[layer_idx][:, :, :retrieval_len, :], 
-                                q_cpu, retrieval_len)
-            self.kbuf[layer_idx][:, :, self.retrieval_budget - retrieval_len:self.retrieval_budget, :].copy_(
-                self.kbuf_cpu[layer_idx][:, :, :retrieval_len, :],
-                non_blocking=True
-            )
-            self.vbuf[layer_idx][:, :, self.retrieval_budget - retrieval_len:self.retrieval_budget, :].copy_(
-                self.vbuf_cpu[layer_idx][:, :, :retrieval_len, :],
-                non_blocking=True
-            )
-
-        assert self.kvbuf_suffix_len < self.kvbuf_suffix_maxlen
-
-        # 4. use flash attention with retrieved KV cache, fused with kvcache update
         start = self.retrieval_budget - retrieval_len
-        end = self.retrieval_budget + self.kvbuf_prefix_len + self.kvbuf_suffix_len + 1  # +1 for current token
-        attn_out = flash_attn_with_kvcache(
-            q=queries,
-            k=key,
-            v=value,
-            cache_seqlens=self.kvbuf_prefix_len + self.kvbuf_suffix_len + retrieval_len,
-            k_cache=self.kbuf[layer_idx][:, :, start:end, :].permute(0, 2, 1, 3),   # convert back to (bsz, seq_len, kh, hd)
-            v_cache=self.vbuf[layer_idx][:, :, start:end, :].permute(0, 2, 1, 3),   # convert back to (bsz, seq_len, kh, hd)
-            causal=True
+        return self.kbuf[layer_idx][:, :, start:, :].permute(0, 2, 1, 3), self.vbuf[layer_idx][:, :, start:, :].permute(0, 2, 1, 3)
+    
+    def decode_pre_query_operation(self, queries: torch.Tensor):
+        group_size = self.num_q_heads // self.num_kv_heads
+        q_mean = queries.view(self.batch_size, self.num_kv_heads, group_size, self.head_dim).mean(dim=2)  # (bsz, num_kv_heads, head_dim)
+        self.qbuf_cpu.copy_(q_mean, non_blocking=True)
+
+    def decode_post_query_operation(self, layer_idx):
+        retrieval_len = min(self.retrieval_region_len, self.retrieval_budget)
+        if retrieval_len <= 0:
+            return
+        
+        # D2H copy retrieved KV from CPU to GPU
+        self.kbuf[layer_idx][:, :, self.retrieval_budget - retrieval_len:self.retrieval_budget, :].copy_(
+            self.kbuf_cpu[layer_idx][:, :, :retrieval_len, :],
+            non_blocking=True
+        )
+        self.vbuf[layer_idx][:, :, self.retrieval_budget - retrieval_len:self.retrieval_budget, :].copy_(
+            self.vbuf_cpu[layer_idx][:, :, :retrieval_len, :],
+            non_blocking=True
         )
 
+    def decode_query_kvcache(self, layer_idx):
+        retrieval_len = min(self.retrieval_region_len, self.retrieval_budget)
+        if retrieval_len > 0:
+            # wait for previous query copy
+            torch.cuda.synchronize()
+            with Timer("data_layer_query", logger=None):
+                # CPU retrieved KV: (bsz, num_kv_heads, retrieval_len, head_dim)
+                self.data_layers[layer_idx].query(self.kbuf_cpu_np[layer_idx][:, :, :retrieval_len, :], 
+                                self.vbuf_cpu_np[layer_idx][:, :, :retrieval_len, :], 
+                                self.qbuf_cpu_np, retrieval_len)
+        assert self.kvbuf_suffix_len < self.kvbuf_suffix_maxlen
         if layer_idx == self.num_layers - 1:
             self.kvbuf_suffix_len += 1
-
-        return attn_out
 
     def save_prefill_cache(self, prefill_cache_path):
         print("Saving prefill cache...")
@@ -299,5 +288,9 @@ class DiffCache:
 
         print("Prefill cache loaded.")
 
-    def cached_seq_len(self, layer_idx):
+    def seq_len(self, layer_idx):
         return self.kvbuf_prefix_len + self.kvbuf_suffix_len + self.retrieval_region_len
+
+    def seq_len_gpu(self, layer_idx):
+        retrieval_len = min(self.retrieval_region_len, self.retrieval_budget)
+        return self.kvbuf_prefix_len + self.kvbuf_suffix_len + retrieval_len
