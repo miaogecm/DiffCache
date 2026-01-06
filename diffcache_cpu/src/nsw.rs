@@ -1,5 +1,5 @@
-use crate::{Distance, HugeArray, L2Square, Neighbour, NodeID, prefetch_ptr};
-use std::{array, cmp::{Reverse, max, min}, collections::{BinaryHeap, HashSet}, f32, io::{BufReader, BufWriter}, iter::repeat_with, marker::PhantomData, ops::{Add, Div}, path::Path, sync::atomic::Ordering, time::Instant};
+use crate::{Distance, HugeArray, L2Square, Neighbour, NodeID, dualheap::DualHeap, prefetch_ptr};
+use std::{array, cmp::{Reverse, max, min}, collections::{BinaryHeap, HashSet}, f32, io::{BufReader, BufWriter}, iter::repeat_with, marker::PhantomData, ops::{Add, Div}, path::Path, sync::{OnceLock, atomic::Ordering}, time::Instant};
 use crate::{Value};
 use std::cell::RefCell;
 use super::tlset::TLSet;
@@ -11,6 +11,10 @@ use std::sync::atomic::AtomicUsize;
 use crate::InnerProduct;
 
 const MAX_NUM_NEIGHBOURS: usize = 32;
+const MAX_EF: usize = 16384;
+
+const STABILITY_CHECK_INTERVAL: usize = 2;
+const STABILITY_CHECK_THRESHOLD: usize = 4;
 
 pub const BATCH_SIZE: usize = 1;
 
@@ -21,6 +25,8 @@ pub struct Options {
     pub n_max: usize,      // maximum number of nodes
     pub r_sq: f32,
     pub name: String,
+    pub attn_mass_threshold: f32,
+    pub k_check_seq: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -102,6 +108,20 @@ fn prefetch_slice<T, const LOCALITY: i32, const LINES: i32>(slice: &[T]) {
     }
 }
 
+static LOG_RANKS: OnceLock<Vec<f64>> = OnceLock::new();
+
+fn precompute_log_ranks() -> Vec<f64> {
+    let mut v = Vec::with_capacity(MAX_EF);
+    for r in 1..=MAX_EF {
+        v.push((r as f64).ln());
+    }
+    v
+}
+
+fn get_log_ranks() -> &'static [f64] {
+    LOG_RANKS.get_or_init(precompute_log_ranks)
+}
+
 impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
     // NOTE: distance should be positive (will be compared using bits)
     #[inline(always)]
@@ -174,21 +194,131 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
         &self.vals[start..start + self.dim]
     }
 
+    fn fit_alpha_from_logits(logits_sorted: &[f32], min_rank: usize) -> Option<f32> {
+        let h = logits_sorted.len();
+        if h == 0 {
+            return None;
+        }
+        if min_rank == 0 || min_rank >= h {
+            return None;
+        }
+
+        let log_ranks = get_log_ranks();
+        if h > log_ranks.len() {
+            return None;
+        }
+
+        let n = (h - min_rank + 1) as f64;
+        if n < 2.0 {
+            return None;
+        }
+
+        let mut sx = 0.0f64;
+        let mut sy = 0.0f64;
+        let mut sxx = 0.0f64;
+        let mut sxy = 0.0f64;
+
+        // Minimize squared error to fit y = a + b*x
+        for (idx, &z) in logits_sorted.iter().enumerate().skip(min_rank - 1) {
+            let x = log_ranks[idx]; // ln(rank), rank = idx+1
+            let y = z as f64;
+
+            sx += x;
+            sy += y;
+            sxx += x * x;
+            sxy += x * y;
+        }
+
+        let denom = n * sxx - sx * sx;
+        if denom.abs() < 1e-12 {
+            return None;
+        }
+
+        let b = (n * sxy - sx * sy) / denom;
+        let alpha = -b as f32;
+        Some(alpha)
+    }
+
+    pub fn estimate_top_h_mass(logits_sorted: &[f32], h: usize, alpha: f32) -> Option<f32> {
+        let n = logits_sorted.len();
+        if h == 0 || h > n {
+            return None;
+        }
+        if alpha <= 1.0 {
+            // power-law tail with alpha <= 1 has infinite mass in the idealized model
+            return None;
+        }
+
+        // use safe exponentiation: subtract the max over the head
+        let head_slice = &logits_sorted[..h];
+        let &max_logit = head_slice.iter().fold(&head_slice[0], |a, b| if b > a { b } else { a });
+
+        let mut head_sum = 0.0f32; // sum of exp(z_i - max)
+        for &z in head_slice {
+            head_sum += (z - max_logit).exp();
+        }
+
+        // v_H in the same scaled space: exp(z_H - max)
+        let z_h = head_slice[h - 1];
+        let v_h_scaled = (z_h - max_logit).exp();
+
+        // tail weight under power-law approximation (in the same scaled units)
+        // TailWeight' ≈ v_H' * H / (alpha - 1)
+        let h_f = h as f32;
+        let tail_weight = v_h_scaled * h_f / (alpha - 1.0);
+
+        // estimated mass of top-H: head_sum / (head_sum + tail_weight)
+        let denom = head_sum + tail_weight;
+        if denom <= 0.0 {
+            return None;
+        }
+
+        Some(head_sum / denom)
+    }
+
+    #[inline(always)]
+    fn k_check_early_stoppable(&self, nearest: Vec<Neighbour>) -> bool {
+        let sqrt_dim = f32::sqrt(self.dim as f32);
+        let logits = nearest.iter().map(|n| {
+            // TODO:
+            (65536.0 - n.dist) / sqrt_dim
+        }).collect::<Vec<_>>();
+
+        let Some(alpha) = Self::fit_alpha_from_logits(&logits, 5) else {
+            return false;
+        };
+        let Some(mass) = Self::estimate_top_h_mass(&logits, nearest.len(), alpha) else {
+            return false;
+        };
+
+        mass >= self.options.attn_mass_threshold
+    }
+
     /// Searches for `ef` nearest neighbors of a query vector `q` in the layer from entry points `ep`.
     /// Note that the returned neighbors are sorted by distance (from min to max)
     #[inline(always)]
     fn search_nn(&self, q: &[T], ep: &[Neighbour], ef: usize, dist_mode: DistMode) -> Vec<Neighbour> {
-        let mut candidates: BinaryHeap<Reverse<u64>> = ep.iter().map(|n| Reverse(n.clone().into())).collect(); // candidate nearest neighbors (min-heap)
-        let mut nns       : BinaryHeap<u64>          = ep.iter().map(|n| n.clone().into()).collect();          // result nearest neighbors    (max-heap)
+        let mut k_check_epoch = 0;
+        let mut k_check_next = min(self.options.k_check_seq[k_check_epoch], ef);
+        if matches!(dist_mode, DistMode::KKDist) {
+            k_check_next = ef; // disable k-check for insertion
+        }
 
-        let mut furthest = nns.peek().map_or(Distance::INFINITY, |n| Neighbour::from(*n).dist);
+        let mut last_small_replace_count = 0;
+        let mut num_expansion = 0;
+
+        let mut candidates: BinaryHeap<Reverse<u64>> = ep.iter().map(|n| Reverse(n.clone().into())).collect(); // candidate nearest neighbors (min-heap)
+        let mut nns: DualHeap<u64> = DualHeap::from_iter_with(
+            k_check_next, ef, ep.iter().map(|n| n.clone().into())
+        );  // result nearest neighbors
+
+        let mut furthest = nns.kept_max().map_or(Distance::INFINITY, |n| Neighbour::from(*n).dist);
+        let mut dth_min = nns.dth_min().map_or(Distance::INFINITY, |n| Neighbour::from(*n).dist);
 
         let mut visited_set = self.visited_set.get_handle();
         ep.iter().map(|n| n.node).for_each(|id| {
             visited_set.insert(id as usize);
         });
-
-        nns.reserve(ef);
 
         // BFS from entry points
         while let Some(Reverse(peek)) = candidates.peek() {
@@ -201,6 +331,32 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
             if peek.dist > furthest && nns.len() >= ef {
                 break;
             }
+
+            // perform k check when top-d is stablized (peek.dist > dth_min)
+            if k_check_next < ef && nns.len() >= k_check_next && num_expansion % STABILITY_CHECK_INTERVAL == 0 {
+                // stability check
+                let small_replace_count = nns.small_replace_count;
+                println!("stability check at nns len {} (replaced {})", nns.len(), small_replace_count - last_small_replace_count);
+                if small_replace_count - last_small_replace_count <= STABILITY_CHECK_THRESHOLD {
+                    // stablized, run k-check
+                    let early_stoppable = self.k_check_early_stoppable(
+                        nns.small.clone().into_sorted_vec().into_iter().map(|n| Neighbour::from(n)).collect()
+                    );
+                    if early_stoppable {
+                        // attn mass covered, stop searching
+                        println!("early stoppable at {} (nns len: {})", k_check_next, nns.len());
+                        // TODO:
+                        k_check_next = ef; // disable further k-check
+                    } else {
+                        // next epoch
+                        k_check_epoch += 1;
+                        k_check_next = min(self.options.k_check_seq[k_check_epoch], ef);
+                    }
+                }
+                last_small_replace_count = small_replace_count;
+            }
+
+            num_expansion += 1;
 
             // pop the nearest candidate
             candidates.pop();
@@ -244,13 +400,9 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
                 // add to candidates
                 candidates.push(Reverse(Neighbour { dist, node: node_id }.into()));
                 let neigh = Neighbour { dist, node: node_id };
-                if nns.len() >= ef {
-                    // if the result set exceeds ef, remove the furthest neighbor
-                    *nns.peek_mut().unwrap() = neigh.into();
-                } else {
-                    nns.push(neigh.into());
-                }
-                furthest = nns.peek().map_or(Distance::INFINITY, |n| Neighbour::from(*n).dist);
+                nns.push(neigh.into());
+                furthest = nns.kept_max().map_or(Distance::INFINITY, |n| Neighbour::from(*n).dist);
+                dth_min = nns.dth_min().map_or(Distance::INFINITY, |n| Neighbour::from(*n).dist);
             }
         }
 

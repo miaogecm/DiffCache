@@ -1,24 +1,3 @@
-//! # DiffCache: Differential KVCache Indexing for Fast, Memory-efficient LLM Inference
-//! 
-//! This library contains the on-CPU data layer of DiffCache. In diff cache, on-GPU index
-//! layer and on-CPU data layer work cooperatively to index important tokens in the KVCache.
-//! The index layer search for high-quality entry points (eps) for the data layer, and the 
-//! data layer retrieves relevant KV pairs based on these entry points.
-//! 
-//! ## Core Interfaces
-//! 
-//! (0) new(bsz, qkv_mapping, kv_head_num, head_dim)
-//!     Create a DiffCache data layer instance
-//! 
-//! (1) insert(self, K, V)                   (KV: (bsz,     kv_head_num, head_dim))
-//!     Insert KV into the cache                 
-//! 
-//! (2) query(self, Q, ef)                   (Q:  (bsz, kv_head_num, head_dim))
-//!                             (ret: (K, V) with (bsz, kv_head_num, ef, head_dim))
-//!                                          (not (bsz, ef, kv_head_num, head_dim) !!!)
-//!     Query the cache with Q to retrieve top ef relevant KVs
-//! 
-
 use std::{cmp::min, ops::{Add, Deref, DerefMut, Div}, sync::{Arc, atomic::{AtomicBool, AtomicUsize}}, time::Instant};
 use metrics::counter;
 use ndarray::{Array, Array1, Array2, Array3, Array4, ArrayView, ArrayView1, ArrayView2, ArrayView3, ArrayView4, ArrayViewMut, ArrayViewMut4, Axis, Data, Dimension, Ix4, ShapeBuilder, Zip, s};
@@ -29,6 +8,7 @@ use pyo3::{prelude::*, types::PyDict};
 use metrics_exporter_tcp::TcpBuilder;
 use rayon::prelude::*;
 
+mod dualheap;
 mod tlset;
 mod nsw;
 
@@ -194,7 +174,9 @@ pub struct Options {
     r_sq: Vec<f32>,
     batch_search: bool,
     name: String,
-    use_bruteforce: bool
+    use_bruteforce: bool,
+    attn_mass_threshold: f32,
+    k_check_seq: Vec<usize>,
 }
 
 pub struct DataLayer<T: Clone> {
@@ -223,6 +205,8 @@ impl<T: 'static + Send + Sync + Clone + Value + Copy + InnerProduct + L2Square> 
                         ef_cons: opt.ef_cons,
                         r_sq: opt.r_sq[h],
                         name: format!("{}b{:03}h{:03}", opt.name, indexes.len(), h),
+                        attn_mass_threshold: opt.attn_mass_threshold,
+                        k_check_seq: opt.k_check_seq.clone(),
                     }
                 ));
             }
@@ -398,7 +382,9 @@ impl DiffCacheCPU {
             r_sq: [4.0].repeat(kv_head_num),
             batch_search: false,
             name: "l0".into(),
-            use_bruteforce: false
+            use_bruteforce: false,
+            attn_mass_threshold: 0.9,
+            k_check_seq: vec![100, 200, 300, 400, 800, 1600, 3200, 6400, 12800, 25600],
         };
         if let Some(dict) = kwargs {
             for (key, value) in dict.iter() {
@@ -409,6 +395,9 @@ impl DiffCacheCPU {
                     k if k == "r_sq" => opt.r_sq = value.extract::<Vec<f32>>().unwrap(),
                     k if k == "batch_search" => opt.batch_search = value.extract::<bool>().unwrap(),
                     k if k == "name" => opt.name = value.extract::<String>().unwrap(),
+                    k if k == "use_bruteforce" => opt.use_bruteforce = value.extract::<bool>().unwrap(),
+                    k if k == "attn_mass_threshold" => opt.attn_mass_threshold = value.extract::<f32>().unwrap(),
+                    k if k == "k_check_seq" => opt.k_check_seq = value.extract::<Vec<usize>>().unwrap(),
                     _ => panic!("Unknown option {key}"),
                 }
             }

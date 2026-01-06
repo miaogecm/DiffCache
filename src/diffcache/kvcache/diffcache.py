@@ -27,6 +27,8 @@ class DiffCache:
         kvbuf_prefix_len: int,
         kvbuf_suffix_len: int,
         kvbuf_suffix_maxlen: int,
+        attn_mass_threshold: float,
+        k_check_seq: List[int],
         r_sq: List[List[float]]
     ) -> None:
         self.num_layers = num_layers
@@ -92,7 +94,9 @@ class DiffCache:
                 m=self.nsw_m,
                 ef_cons=self.nsw_ef_cons,
                 r_sq=self.r_sq[layer_idx],
-                name=f"l{layer_idx:03d}"
+                name=f"l{layer_idx:03d}",
+                attn_mass_threshold=attn_mass_threshold,
+                k_check_seq=k_check_seq
             )
         
         # initialize performance metrics

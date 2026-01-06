@@ -154,6 +154,8 @@ class QwenModel(BaseModel):
             kvbuf_prefix_len = config["kvbuf_prefix_len"],
             kvbuf_suffix_len = config["kvbuf_suffix_len"],
             kvbuf_suffix_maxlen = config["kvbuf_suffix_maxlen"],
+            attn_mass_threshold = config["attn_mass_threshold"],
+            k_check_seq = config["k_check_seq"]
         )
         print(f"KVCache init")
 

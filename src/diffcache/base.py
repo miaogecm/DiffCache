@@ -69,11 +69,11 @@ class BaseModel:
                                                                          layer.input_layernorm_variance_epsilon, 
                                                                          layer.input_layernorm_weight)
         
-        query_states, key_states, value_states = self.wqkv(temp_hidden_states, layer)
+        temp_query_states, temp_key_states, value_states = self.wqkv(temp_hidden_states, layer)
+        query_states, key_states = self.position_embedd(temp_query_states, temp_key_states, 0)
 
-        del temp_hidden_states
+        del temp_hidden_states, temp_query_states, temp_key_states
         torch.cuda.empty_cache()
-        query_states, key_states = self.position_embedd(query_states, key_states, 0)
 
         query_states = query_states.view(bsz, seq_len, self.num_heads, self.head_dim)       # reshape [bs, seq_len, dim] => [bs, seq_len, head, head_dim]
         key_states = key_states.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)

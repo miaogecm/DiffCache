@@ -1,8 +1,10 @@
 {
-    "retrieval_budget": 128,
+    "retrieval_budget": 1024,
     "nsw_m": 16,
     "nsw_ef_cons": 200,
     "kvbuf_prefix_len": 128,
     "kvbuf_suffix_len": 128,
-    "kvbuf_suffix_maxlen": 512
+    "kvbuf_suffix_maxlen": 512,
+    "attn_mass_threshold": 0.90,
+    "k_check_seq": [1048576]
 }
