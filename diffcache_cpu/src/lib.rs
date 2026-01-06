@@ -1,4 +1,5 @@
 use std::{cmp::min, ops::{Add, Deref, DerefMut, Div}, sync::{Arc, atomic::{AtomicBool, AtomicUsize}}, time::Instant};
+use crossbeam_channel::unbounded;
 use metrics::counter;
 use ndarray::{Array, Array1, Array2, Array3, Array4, ArrayView, ArrayView1, ArrayView2, ArrayView3, ArrayView4, ArrayViewMut, ArrayViewMut4, Axis, Data, Dimension, Ix4, ShapeBuilder, Zip, s};
 use numpy::{IntoPyArray, PyArray3, PyArray4, PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4, PyReadwriteArray4};
@@ -7,6 +8,12 @@ use std::sync::RwLock;
 use pyo3::{prelude::*, types::PyDict};
 use metrics_exporter_tcp::TcpBuilder;
 use rayon::prelude::*;
+use std::ffi::c_void;
+use std::mem::{size_of, MaybeUninit};
+use std::ptr;
+use cuda_sys::cuda::{
+    CUDA_MEMCPY2D, CUdevice, CUdeviceptr, CUmemorytype_enum::{CU_MEMORYTYPE_DEVICE, CU_MEMORYTYPE_HOST}, CUresult, CUstream, cuMemcpy2DAsync_v2
+};
 
 mod dualheap;
 mod tlset;
@@ -189,6 +196,99 @@ pub struct DataLayer<T: Clone> {
     opt: Options,
 }
 
+#[inline]
+fn cu_check(res: CUresult) {
+    // Minimal error handling; extend with cuGetErrorName/cuGetErrorString if you want.
+    assert_eq!(res as u32, 0, "CUDA Driver API call failed: {:?}", res);
+}
+
+pub unsafe fn copy_k_or_v_chunk_h2d<T>(
+    dst_dev: CUdeviceptr,
+    src_host: *const T,
+    bsz: usize,
+    kv_head: usize,
+    ef: usize,
+    head_dim: usize,
+    last_k_check: usize,
+    k_check: usize,
+    stream: CUstream,
+) {
+    let k_range = k_check - last_k_check;
+    assert!(k_check <= ef);
+    assert!(k_range > 0);
+
+    let rows = bsz * kv_head;
+    let elem = size_of::<T>();
+
+    let width_bytes = k_range * head_dim * elem;
+    let dst_pitch_bytes = ef * head_dim * elem;
+    let src_pitch_bytes = width_bytes; // packed host chunk
+
+    // Offset within each device row: last_k_check * head_dim elements
+    let dst_x_bytes = last_k_check * head_dim * elem;
+
+    // Build CUDA_MEMCPY2D descriptor.
+    let mut copy: CUDA_MEMCPY2D = MaybeUninit::zeroed().assume_init();
+
+    // Source (host)
+    copy.srcMemoryType = CU_MEMORYTYPE_HOST;
+    copy.srcHost = src_host as *const c_void;
+    copy.srcPitch = src_pitch_bytes;
+    copy.srcXInBytes = 0;
+    copy.srcY = 0;
+
+    // Destination (device)
+    copy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+    copy.dstDevice = dst_dev;
+    copy.dstPitch = dst_pitch_bytes;
+    copy.dstXInBytes = dst_x_bytes;
+    copy.dstY = 0;
+
+    // Rectangle size
+    copy.WidthInBytes = width_bytes;
+    copy.Height = rows;
+
+    cu_check(cuMemcpy2DAsync_v2(&copy as *const CUDA_MEMCPY2D, stream));
+}
+
+pub unsafe fn copy_kv_chunk_h2d<T>(
+    out_keys_gpu: CUdeviceptr,
+    out_vals_gpu: CUdeviceptr,
+    chunk_keys_host: *const T,
+    chunk_vals_host: *const T,
+    bsz: usize,
+    kv_head: usize,
+    ef: usize,
+    head_dim: usize,
+    last_k_check: usize,
+    k_check: usize,
+    stream: CUstream,
+) {
+    copy_k_or_v_chunk_h2d::<T>(
+        out_keys_gpu,
+        chunk_keys_host,
+        bsz,
+        kv_head,
+        ef,
+        head_dim,
+        last_k_check,
+        k_check,
+        stream,
+    );
+
+    copy_k_or_v_chunk_h2d::<T>(
+        out_vals_gpu,
+        chunk_vals_host,
+        bsz,
+        kv_head,
+        ef,
+        head_dim,
+        last_k_check,
+        k_check,
+        stream,
+    );
+}
+
 impl<T: 'static + Send + Sync + Clone + Value + Copy + InnerProduct + L2Square> DataLayer<T> {
     pub fn new(bsz: usize, q_head_num: usize, kv_head_num: usize, head_dim: usize, opt: Options) -> Self {
         assert!(q_head_num % kv_head_num == 0, "q_head_num must be multiple of kv_head_num");
@@ -301,6 +401,84 @@ impl<T: 'static + Send + Sync + Clone + Value + Copy + InnerProduct + L2Square> 
             });
 
         counter!(format!("{}_total_query_latency", self.opt.name)).increment(start.elapsed().as_micros() as u64);
+    }
+
+    // out_keys_gpu: (bsz, kv_head_num, ef, head_dim) GPU pointer
+    // out_vals_gpu: (bsz, kv_head_num, ef, head_dim) GPU pointer
+    pub fn query_streaming(&self, cuda_stream: u64, out_keys_gpu: u64, out_vals_gpu: u64, queries: ArrayView3<T>, ef: usize) {
+        let ef = min(ef, self.ctx_len);
+
+        assert_eq!(queries.shape(), &[self.bsz, self.kv_head_num, self.head_dim]);
+
+        let ep = ArrayView1::<Neighbour>::from(&[]);
+
+        // create unbounded channel for every batch and KV head
+        let channels = (0..self.bsz * self.kv_head_num)
+            .map(|_| unbounded::<(Array2<T>, Array2<T>)>())
+            .collect::<Vec<_>>();
+
+        // launch collector thread to copy data to GPU asynchronously
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let cuda_stream = cuda_stream as CUstream;
+                let out_keys_gpu = out_keys_gpu as CUdeviceptr;
+                let out_vals_gpu = out_vals_gpu as CUdeviceptr;
+
+                let mut last_k_check = 0usize;
+
+                for i in 0..self.opt.k_check_seq.len() {
+                    let k_check = self.opt.k_check_seq[i];
+                    if k_check > ef {
+                        break;
+                    }
+
+                    // wait for every batch and KV head to have k_check results
+                    let mut chunk_keys = Array4::<T>::from_elem((self.bsz, self.kv_head_num, k_check, self.head_dim), T::zero());
+                    let mut chunk_vals = Array4::<T>::from_elem((self.bsz, self.kv_head_num, k_check, self.head_dim), T::zero());
+                    for b in 0..self.bsz {
+                        for kh in 0..self.kv_head_num {
+                            let idx = b * self.kv_head_num + kh;
+                            let rx = &channels[idx].1;
+                            let (out_keys, out_vals) = rx.recv().unwrap();
+                            chunk_keys.slice_mut(s![b, kh, last_k_check..k_check, ..]).assign(&out_keys.slice(s![.., ..]));
+                            chunk_vals.slice_mut(s![b, kh, last_k_check..k_check, ..]).assign(&out_vals.slice(s![.., ..]));
+                        }
+                    }
+
+                    // copy chunk to GPU using cuda memcpy2d. semantics:
+                    // out_keys_gpu[:, :, last_k_check:k_check, :] = chunk_keys
+                    // out_vals_gpu[:, :, last_k_check:k_check, :] = chunk_vals
+                    // We view out_gpus as a 2D array with shape (bsz * kv_head_num, ef * head_dim),
+                    // then we can leverage cudaMemcpy2D to copy each row with proper pitch and width
+                    unsafe { copy_kv_chunk_h2d(
+                        out_keys_gpu,
+                        out_vals_gpu,
+                        chunk_keys.as_ptr(),
+                        chunk_vals.as_ptr(),
+                        self.bsz,
+                        self.kv_head_num,
+                        ef,
+                        self.head_dim,
+                        last_k_check,
+                        k_check,
+                        cuda_stream,
+                    ) };
+
+                    last_k_check = k_check;
+                }
+            });
+
+            // launch search threads
+            self.indexes.par_iter().enumerate()
+                .for_each(|(idx, index)| {
+                    let b = idx / self.kv_head_num;
+                    let kh = idx % self.kv_head_num;
+
+                    let query = queries.slice(s![b, kh, ..]);
+
+                    index.search_streaming(query, ef, ep, &channels[idx].0);
+                });
+        });
     }
 
     pub fn save(&self, prefix: &str) {
@@ -443,6 +621,18 @@ impl DiffCacheCPU {
         let out_vals = view_u16_as_bf16_mut(out_vals.as_array_mut());
         let queries = view_u16_as_bf16(queries.as_array());
         self.data_layer.query(out_keys, out_vals, queries, ef);
+    }
+
+    fn query_streaming<'py>(
+        &self,
+        cuda_stream: u64,
+        out_keys_gpu: u64,
+        out_vals_gpu: u64,
+        queries: PyReadonlyArray3<'py, u16>,
+        ef: usize,
+    ) {
+        let queries = view_u16_as_bf16(queries.as_array());
+        self.data_layer.query_streaming(cuda_stream, out_keys_gpu, out_vals_gpu, queries, ef);
     }
 
     fn save(&self, path: &str) {

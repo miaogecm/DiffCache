@@ -3,6 +3,7 @@ use std::{array, cmp::{Reverse, max, min}, collections::{BinaryHeap, HashSet}, f
 use crate::{Value};
 use std::cell::RefCell;
 use super::tlset::TLSet;
+use crossbeam_channel::Sender;
 use metrics::counter;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
 use serde::{Deserialize, Serialize};
@@ -297,7 +298,7 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
     /// Searches for `ef` nearest neighbors of a query vector `q` in the layer from entry points `ep`.
     /// Note that the returned neighbors are sorted by distance (from min to max)
     #[inline(always)]
-    fn search_nn(&self, q: &[T], ep: &[Neighbour], ef: usize, dist_mode: DistMode) -> Vec<Neighbour> {
+    fn search_nn(&self, q: &[T], ep: &[Neighbour], ef: usize, dist_mode: DistMode, tx: Option<&Sender<(Array2<T>, Array2<T>)>>) -> Vec<Neighbour> {
         let mut k_check_epoch = 0;
         let mut k_check_next = min(self.options.k_check_seq[k_check_epoch], ef);
         if matches!(dist_mode, DistMode::KKDist) {
@@ -320,6 +321,8 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
             visited_set.insert(id as usize);
         });
 
+        let mut emitted = HashSet::new();
+
         // BFS from entry points
         while let Some(Reverse(peek)) = candidates.peek() {
             let peek: Neighbour = (*peek).into();
@@ -336,9 +339,31 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
             if k_check_next < ef && nns.len() >= k_check_next && num_expansion % STABILITY_CHECK_INTERVAL == 0 {
                 // stability check
                 let small_replace_count = nns.small_replace_count;
-                println!("stability check at nns len {} (replaced {})", nns.len(), small_replace_count - last_small_replace_count);
+                // println!("stability check at nns len {} (replaced {})", nns.len(), small_replace_count - last_small_replace_count);
                 if small_replace_count - last_small_replace_count <= STABILITY_CHECK_THRESHOLD {
-                    // stablized, run k-check
+                    // stablized
+
+                    // (1) emit unemitted intermediate results if necessary
+                    if let Some(tx) = tx {
+                        let unemitted_nns = nns.clone().into_sorted_vec().into_iter()
+                            .map(|n| Neighbour::from(n))
+                            .filter(|n| !emitted.contains(&n.node))
+                            .collect::<Vec<_>>();
+                        if !unemitted_nns.is_empty() {
+                            let mut out_keys: Array2<T> = Array2::from_elem((unemitted_nns.len(), self.dim), T::zero());
+                            let mut out_vals: Array2<T> = Array2::from_elem((unemitted_nns.len(), self.dim), T::zero());
+                            for (i, neighbor) in unemitted_nns.iter().enumerate() {
+                                let key_slice = self.get_key(neighbor.node);
+                                let val_slice = self.get_val(neighbor.node);
+                                out_keys.slice_mut(s![i, ..key_slice.len()]).assign(&ArrayView1::from(key_slice));
+                                out_vals.slice_mut(s![i, ..val_slice.len()]).assign(&ArrayView1::from(val_slice));
+                                emitted.insert(neighbor.node);
+                                tx.send((out_keys.clone(), out_vals.clone())).unwrap();
+                            }
+                        }
+                    }
+                    
+                    // (2) run k-check
                     let early_stoppable = self.k_check_early_stoppable(
                         nns.small.clone().into_sorted_vec().into_iter().map(|n| Neighbour::from(n)).collect()
                     );
@@ -534,7 +559,7 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
         // search nearest neighbours
         if let Some(ep) = ep {
             // expand and select neighbours
-            let ep = self.search_nn(key, &ep, self.options.ef_cons, DistMode::KKDist);
+            let ep = self.search_nn(key, &ep, self.options.ef_cons, DistMode::KKDist, None);
             let neighbours = self.select_neighbors(&ep, self.options.m).iter().map(|n| n.node).collect::<Vec<_>>();
 
             // create node and node -> neighbor connection
@@ -616,7 +641,7 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
         let start = Instant::now();
 
         // search at level 0
-        let neighbors = self.search_nn(query, &ep, ef, DistMode::QKDist);
+        let neighbors = self.search_nn(query, &ep, ef, DistMode::QKDist, None);
 
         let search_time = start.elapsed().as_micros() as usize;
         counter!(format!("{}_search_latency", self.options.name)).increment(search_time as u64);
@@ -633,6 +658,23 @@ impl<T: Sync + Clone + Value + Copy + InnerProduct + L2Square> Index<T> {
 
         let collect_time = start.elapsed().as_micros() as usize - search_time;
         counter!(format!("{}_collect_latency", self.options.name)).increment(collect_time as u64);
+    }
+
+    pub fn search_streaming(&self, query: ArrayView1<T>, ef: usize, ep: ArrayView1<Neighbour>, tx: &Sender<(Array2<T>, Array2<T>)>) {
+        assert_eq!(query.shape()[0], self.dim, "Query dimension does not match index dimension");
+        let query = query.as_slice().unwrap();
+        let ep = ep.as_slice().unwrap();
+        let ep = self.get_ep(query, ep, &DistMode::QKDist).unwrap();
+
+        counter!(format!("{}_num_searches", self.options.name)).increment(1);
+
+        let start = Instant::now();
+
+        // search at level 0
+        let neighbors = self.search_nn(query, &ep, ef, DistMode::QKDist, Some(tx));
+
+        let search_time = start.elapsed().as_micros() as usize;
+        counter!(format!("{}_search_latency", self.options.name)).increment(search_time as u64);
     }
 
     pub fn new(dim: usize, options: Options) -> Self {

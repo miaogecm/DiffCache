@@ -94,6 +94,18 @@ impl<T: Ord> Extend<T> for DualHeap<T> {
     }
 }
 
+impl<T: Ord + Clone> Clone for DualHeap<T> {
+    fn clone(&self) -> Self {
+        Self {
+            small: self.small.clone(),
+            rest:  self.rest.clone(),
+            small_replace_count: self.small_replace_count,
+            d: self.d,
+            cap: self.cap,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
